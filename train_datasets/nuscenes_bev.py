@@ -7,6 +7,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from utils.geometry import quaternion_to_matrix, transform_matrix
 from utils.nuscenes_utils import (
     annotation_to_array,
     get_nuscenes_handle,
@@ -100,12 +101,28 @@ class NuScenesBEVDataset(Dataset):
             torch.stack(extrinsics, dim=0),
         )
 
+    def _get_world_to_ego(self, sample_rec: Dict[str, Any]) -> Tuple[np.ndarray, float]:
+        """Return world-to-ego transform and ego yaw for current sample."""
+        ref_sensor = self.cameras[0]
+        ref_token = sample_rec["data"][ref_sensor]
+        sd_rec = self.nusc.get("sample_data", ref_token)
+        ego_pose = self.nusc.get("ego_pose", sd_rec["ego_pose_token"])
+        world_to_ego = transform_matrix(ego_pose["translation"], ego_pose["rotation"], inverse=True)
+        rot = quaternion_to_matrix(ego_pose["rotation"])
+        ego_yaw = float(np.arctan2(rot[1, 0], rot[0, 0]))
+        return world_to_ego.astype(np.float32), ego_yaw
+
     def _load_boxes(self, sample_rec: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         gt_boxes = []
         gt_labels = []
+        world_to_ego, ego_yaw = self._get_world_to_ego(sample_rec)
         for ann_token in sample_rec["anns"]:
             ann = self.nusc.get("sample_annotation", ann_token)
             box, label = annotation_to_array(ann)
+            center = np.concatenate([box[:3], np.array([1.0], dtype=np.float32)])
+            center_ego = world_to_ego @ center
+            box[:3] = center_ego[:3]
+            box[6] = ((box[6] - ego_yaw + np.pi) % (2 * np.pi)) - np.pi
             gt_boxes.append(box)
             gt_labels.append(label)
 
