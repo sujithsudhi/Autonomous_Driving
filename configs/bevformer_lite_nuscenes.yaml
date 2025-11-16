@@ -9,7 +9,9 @@ dataset:
     - CAM_FRONT
     - CAM_FRONT_RIGHT
     - CAM_FRONT_LEFT
-  image_size: [896, 1568]
+  image_size: [512, 896]
+  train_split: train
+  val_split: val
   bev_bounds:
     x: [-50.0, 50.0]
     y: [-50.0, 50.0]
