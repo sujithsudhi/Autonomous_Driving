@@ -2,6 +2,7 @@ from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.backbones.swin_backbone import SwinBackbone
 from models.camera.bev_head import BEVDetectionHead
@@ -22,11 +23,13 @@ class BEVFormerLite(nn.Module):
         dropout: float = 0.1,
         image_size: Tuple[int, int] = (224, 224),
         attn_chunk_size: int = 256,
+        max_attn_elements: int = 25_000_000,
     ) -> None:
         super().__init__()
         self.num_cams = num_cams
         self.embed_dim = embed_dim
         self.attn_chunk_size = attn_chunk_size
+        self.max_attn_elements = max_attn_elements
         self.backbone = SwinBackbone(
             model_name=backbone_name,
             embed_dim=embed_dim,
@@ -89,21 +92,73 @@ class BEVFormerLite(nn.Module):
 
     def _cross_attend(self, query: torch.Tensor, camera_tokens: torch.Tensor) -> torch.Tensor:
         """Run cross attention in manageable chunks to limit memory overhead."""
-        chunk = self.attn_chunk_size
-        if chunk is None or chunk <= 0 or chunk >= query.shape[1]:
+        chunk = self.attn_chunk_size or query.shape[1]
+        max_chunk = max(
+            1,
+            int(
+                self.max_attn_elements
+                // max(1, query.shape[0] * self.cross_attn.num_heads * camera_tokens.shape[1])
+            ),
+        )
+
+        if chunk <= 0 or chunk >= query.shape[1]:
+            chunk = query.shape[1]
+
+        if chunk > max_chunk:
+            if not hasattr(self, "_warned_chunk"):
+                print(
+                    f"[BEVFormerLite] Reducing cross-attn chunk size from {chunk} to {max_chunk} "
+                    "to avoid excessive attention memory."
+                )
+                self._warned_chunk = True
+            chunk = max_chunk
+
+        if chunk >= query.shape[1]:
             attn_output, _ = self.cross_attn(
                 query, camera_tokens, camera_tokens, need_weights=False
             )
             return attn_output
 
         outputs = []
+        # Project K/V once to avoid redundant allocations for each chunk
+        k_proj = F.linear(
+            camera_tokens,
+            self.cross_attn.in_proj_weight[self.embed_dim : 2 * self.embed_dim],
+            self.cross_attn.in_proj_bias[self.embed_dim : 2 * self.embed_dim]
+            if self.cross_attn.in_proj_bias is not None
+            else None,
+        )
+        v_proj = F.linear(
+            camera_tokens,
+            self.cross_attn.in_proj_weight[2 * self.embed_dim :],
+            self.cross_attn.in_proj_bias[2 * self.embed_dim :]
+            if self.cross_attn.in_proj_bias is not None
+            else None,
+        )
+        k_proj = k_proj.view(query.shape[0], -1, self.cross_attn.num_heads, self.cross_attn.head_dim)
+        v_proj = v_proj.view(query.shape[0], -1, self.cross_attn.num_heads, self.cross_attn.head_dim)
+        k_proj = k_proj.transpose(1, 2)
+        v_proj = v_proj.transpose(1, 2)
+
         for start in range(0, query.shape[1], chunk):
             end = min(start + chunk, query.shape[1])
-            attn_chunk, _ = self.cross_attn(
+            q_proj = F.linear(
                 query[:, start:end, :],
-                camera_tokens,
-                camera_tokens,
-                need_weights=False,
+                self.cross_attn.in_proj_weight[: self.embed_dim],
+                self.cross_attn.in_proj_bias[: self.embed_dim]
+                if self.cross_attn.in_proj_bias is not None
+                else None,
             )
-            outputs.append(attn_chunk)
+            q_proj = q_proj.view(query.shape[0], -1, self.cross_attn.num_heads, self.cross_attn.head_dim)
+            q_proj = q_proj.transpose(1, 2)
+
+            attn_output = F.scaled_dot_product_attention(
+                q_proj,
+                k_proj,
+                v_proj,
+                dropout_p=self.cross_attn.dropout if self.training else 0.0,
+            )
+            attn_output = attn_output.transpose(1, 2).reshape(query.shape[0], -1, self.embed_dim)
+            attn_output = self.cross_attn.out_proj(attn_output)
+            outputs.append(attn_output)
         return torch.cat(outputs, dim=1)
