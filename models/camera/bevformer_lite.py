@@ -24,12 +24,14 @@ class BEVFormerLite(nn.Module):
         image_size: Tuple[int, int] = (224, 224),
         attn_chunk_size: int = 256,
         max_attn_elements: int = 25_000_000,
+        camera_token_stride: int = 1,
     ) -> None:
         super().__init__()
         self.num_cams = num_cams
         self.embed_dim = embed_dim
         self.attn_chunk_size = attn_chunk_size
         self.max_attn_elements = max_attn_elements
+        self.camera_token_stride = max(1, camera_token_stride)
         self.backbone = SwinBackbone(
             model_name=backbone_name,
             embed_dim=embed_dim,

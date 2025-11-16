@@ -4,13 +4,13 @@ import os
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import torch
+import torch.distributed as dist
 import yaml
-from torch import amp
-from torch.cuda.amp import GradScaler
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +51,55 @@ def parse_args() -> argparse.Namespace:
 def load_config(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def validate(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    criterion: BEVDetectionLoss,
+    device: torch.device,
+    use_amp: bool,
+) -> Tuple[float, Dict[str, float]]:
+    model.eval()
+    total_loss = 0.0
+    total_items = 0
+    loss_components = {"loss_cls": 0.0, "loss_box": 0.0}
+
+    with torch.no_grad():
+        for batch in dataloader:
+            images = batch["images"].to(device)
+            gt_boxes = batch["gt_boxes"].to(device)
+            gt_labels = batch["gt_labels"].to(device)
+            gt_masks = batch["gt_masks"].to(device)
+
+            batch_size = images.size(0)
+            with autocast(enabled=use_amp):
+                preds = model(images)
+                losses = criterion(
+                    preds["cls_logits"],
+                    preds["box_preds"],
+                    gt_boxes,
+                    gt_labels,
+                    gt_masks,
+                )
+
+            total_loss += losses["loss_total"].item() * batch_size
+            loss_components["loss_cls"] += losses["loss_cls"].item() * batch_size
+            loss_components["loss_box"] += losses["loss_box"].item() * batch_size
+            total_items += batch_size
+
+    if dist.is_initialized():
+        buffer = torch.tensor(
+            [total_loss, loss_components["loss_cls"], loss_components["loss_box"], total_items],
+            device=device,
+        )
+        dist.all_reduce(buffer, op=dist.ReduceOp.SUM)
+        total_loss, cls_sum, box_sum, total_items = buffer.tolist()
+        loss_components = {"loss_cls": cls_sum, "loss_box": box_sum}
+
+    denom = max(total_items, 1)
+    averaged = {k: v / denom for k, v in loss_components.items()}
+    return total_loss / denom, averaged
 
 
 def main() -> None:
@@ -100,6 +149,24 @@ def main() -> None:
         collate_fn=collate_bevformer,
     )
 
+    val_dataset = NuScenesBEVDataset(
+        dataroot=cfg["dataset"]["root"],
+        version=cfg["dataset"]["version"],
+        cameras=cfg["dataset"]["cameras"],
+        bev_bounds=cfg["dataset"]["bev_bounds"],
+        split="val",
+        image_size=cfg["dataset"]["image_size"],
+    )
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=cfg["optimization"].get("val_batch_size", cfg["optimization"]["batch_size"]),
+        shuffle=False,
+        num_workers=cfg["optimization"].get("val_num_workers", cfg["optimization"]["num_workers"]),
+        pin_memory=True,
+        drop_last=False,
+        collate_fn=collate_bevformer,
+    )
+
     model = BEVFormerLite(
         bev_bounds=cfg["dataset"]["bev_bounds"],
         bev_resolution=cfg["dataset"]["bev_resolution"],
@@ -113,6 +180,7 @@ def main() -> None:
         image_size=tuple(cfg["dataset"]["image_size"]),
         attn_chunk_size=cfg["model"].get("cross_attn_chunk_size", 256),
         max_attn_elements=cfg["model"].get("max_cross_attn_elements", 25_000_000),
+        camera_token_stride=cfg["model"].get("camera_token_stride", 1),
     ).to(device)
 
     if distributed:
@@ -130,7 +198,13 @@ def main() -> None:
         lr=cfg["optimization"]["lr"],
         weight_decay=cfg["optimization"]["weight_decay"],
     )
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg["optimization"]["epochs"])
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=cfg["optimization"].get("lr_reduce_factor", 0.5),
+        patience=cfg["optimization"].get("lr_plateau_patience", 5),
+        verbose=is_main_process(),
+    )
     use_amp = cfg["optimization"].get("mixed_precision", device.type == "cuda")
     scaler = GradScaler(enabled=device.type == "cuda" and use_amp)
 
@@ -145,14 +219,17 @@ def main() -> None:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
         start_epoch = checkpoint["epoch"]
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        epochs_since_improvement = checkpoint.get("epochs_since_improvement", 0)
     else:
         start_epoch = 0
+        best_val_loss = float("inf")
+        epochs_since_improvement = 0
 
     output_dir = Path(cfg["experiment"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_history = []
-    val_history = []
+    early_stop_patience = cfg["optimization"].get("early_stop_patience", 10)
 
     for epoch in range(start_epoch, cfg["optimization"]["epochs"]):
         model.train()
@@ -245,17 +322,41 @@ def main() -> None:
                 f"Val total={val_epoch['loss_total']:.4f}"
             )
 
-        scheduler.step()
-        if is_main_process() and (epoch + 1) % cfg["logging"]["checkpoint_interval"] == 0:
-            checkpoint = {
-                "epoch": epoch + 1,
-                "model": model.module.state_dict() if distributed else model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-            }
-            ckpt_path = output_dir / f"epoch_{epoch+1:03d}.pth"
-            torch.save(checkpoint, ckpt_path)
-            print(f"Saved checkpoint to {ckpt_path}")
+        val_loss, val_components = validate(model, val_dataloader, criterion, device, use_amp)
+        scheduler.step(val_loss)
+
+        if is_main_process():
+            lr = optimizer.param_groups[0]["lr"]
+            print(
+                f"Epoch {epoch+1} validation: loss={val_loss:.3f} "
+                f"cls={val_components['loss_cls']:.3f} "
+                f"box={val_components['loss_box']:.3f} lr={lr:.6f}"
+            )
+
+        if val_loss + 1e-6 < best_val_loss:
+            best_val_loss = val_loss
+            epochs_since_improvement = 0
+            if is_main_process():
+                checkpoint = {
+                    "epoch": epoch + 1,
+                    "model": model.module.state_dict() if distributed else model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "epochs_since_improvement": epochs_since_improvement,
+                }
+                ckpt_path = output_dir / "best.pth"
+                torch.save(checkpoint, ckpt_path)
+                print(f"Saved best checkpoint to {ckpt_path}")
+        else:
+            epochs_since_improvement += 1
+            if epochs_since_improvement >= early_stop_patience:
+                if is_main_process():
+                    print(
+                        f"Early stopping at epoch {epoch+1} after "
+                        f"{epochs_since_improvement} epochs without improvement."
+                    )
+                break
 
         barrier()
 

@@ -28,18 +28,23 @@ model:
   bev_num_heads: 8
   cross_attn_chunk_size: 128
   max_cross_attn_elements: 20000000
+  camera_token_stride: 2
   dropout: 0.1
   num_classes: 10
 
 optimization:
   epochs: 24
   batch_size: 4
+  val_batch_size: 4
   lr: 2.0e-4
   weight_decay: 0.01
   warmup_epochs: 1
   num_workers: 4
+  val_num_workers: 2
   mixed_precision: true
+  lr_plateau_patience: 5
+  lr_reduce_factor: 0.5
+  early_stop_patience: 10
 
 logging:
   print_interval: 20
-  checkpoint_interval: 1
