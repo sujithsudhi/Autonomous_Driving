@@ -12,7 +12,9 @@ dataset:
     - CAM_BACK
     - CAM_BACK_LEFT
     - CAM_FRONT_LEFT
-  image_size: [896, 1568]
+  image_size: [512, 896]
+  train_split: train
+  val_split: val
   bev_bounds:
     x: [-50.0, 50.0]
     y: [-50.0, 50.0]
@@ -26,7 +28,6 @@ model:
   bev_num_heads: 8
   cross_attn_chunk_size: 128
   max_cross_attn_elements: 20000000
-  camera_token_stride: 2
   dropout: 0.1
   num_classes: 10
 

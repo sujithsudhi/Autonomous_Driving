@@ -54,6 +54,9 @@ def annotation_to_array(ann_rec: Dict) -> Tuple[np.ndarray, int]:
     quat = np.array(yaw, dtype=np.float32)
     heading = 2 * np.arctan2(quat[3], quat[0])
     box = np.concatenate([center, size, np.array([heading], dtype=np.float32)], axis=0)
-    category = ann_rec["category_name"].split(".")[0]
-    label = CATEGORY_MAPPING.get(category, -1)
+    label = -1
+    for part in ann_rec["category_name"].split("."):
+        if part in CATEGORY_MAPPING:
+            label = CATEGORY_MAPPING[part]
+            break
     return box, label
