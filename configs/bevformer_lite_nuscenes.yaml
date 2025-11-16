@@ -24,6 +24,7 @@ model:
   bev_encoder_layers: 4
   bev_num_heads: 8
   cross_attn_chunk_size: 128
+  max_cross_attn_elements: 20000000
   dropout: 0.1
   num_classes: 10
 
