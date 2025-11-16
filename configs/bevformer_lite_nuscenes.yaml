@@ -8,6 +8,9 @@ dataset:
   cameras:
     - CAM_FRONT
     - CAM_FRONT_RIGHT
+    - CAM_BACK_RIGHT
+    - CAM_BACK
+    - CAM_BACK_LEFT
     - CAM_FRONT_LEFT
   image_size: [512, 896]
   train_split: train
@@ -30,7 +33,7 @@ model:
 
 optimization:
   epochs: 24
-  batch_size: 2
+  batch_size: 4
   lr: 2.0e-4
   weight_decay: 0.01
   warmup_epochs: 1

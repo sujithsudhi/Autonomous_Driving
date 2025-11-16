@@ -74,6 +74,10 @@ class BEVFormerLite(nn.Module):
         tokens = []
         for cam in range(num_cams):
             feat = features[:, cam]
+            if self.camera_token_stride > 1:
+                feat = F.avg_pool2d(
+                    feat, kernel_size=self.camera_token_stride, stride=self.camera_token_stride
+                )
             token = feat.flatten(2).transpose(1, 2)  # (B, HW, C)
             tokens.append(token)
         camera_tokens = torch.cat(tokens, dim=1)
