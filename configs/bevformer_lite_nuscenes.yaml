@@ -1,0 +1,39 @@
+experiment:
+  name: bevformer_lite_nuscenes
+  output_dir: outputs/bevformer_lite
+
+dataset:
+  root: /media/sudhi/4TB/Datasets/nuscenes
+  version: v1.0-mini
+  cameras:
+    - CAM_FRONT
+    - CAM_FRONT_RIGHT
+    - CAM_FRONT_LEFT
+  image_size: [896, 1568]
+  bev_bounds:
+    x: [-50.0, 50.0]
+    y: [-50.0, 50.0]
+    z: [-5.0, 3.0]
+  bev_resolution: 1.0
+
+model:
+  backbone: swin_tiny_patch4_window7_224
+  embed_dim: 256
+  bev_encoder_layers: 4
+  bev_num_heads: 8
+  cross_attn_chunk_size: 128
+  dropout: 0.1
+  num_classes: 10
+
+optimization:
+  epochs: 24
+  batch_size: 2
+  lr: 2.0e-4
+  weight_decay: 0.01
+  warmup_epochs: 1
+  num_workers: 4
+  mixed_precision: true
+
+logging:
+  print_interval: 20
+  checkpoint_interval: 1

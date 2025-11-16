@@ -1,0 +1,109 @@
+from typing import Dict, Tuple
+
+import torch
+import torch.nn as nn
+
+from models.backbones.swin_backbone import SwinBackbone
+from models.camera.bev_head import BEVDetectionHead
+from utils.geometry import create_bev_grid
+
+
+class BEVFormerLite(nn.Module):
+    def __init__(
+        self,
+        bev_bounds: Dict[str, Tuple[float, float]],
+        bev_resolution: float,
+        num_cams: int,
+        backbone_name: str,
+        embed_dim: int,
+        num_classes: int,
+        bev_encoder_layers: int = 4,
+        bev_num_heads: int = 8,
+        dropout: float = 0.1,
+        image_size: Tuple[int, int] = (224, 224),
+        attn_chunk_size: int = 256,
+    ) -> None:
+        super().__init__()
+        self.num_cams = num_cams
+        self.embed_dim = embed_dim
+        self.attn_chunk_size = attn_chunk_size
+        self.backbone = SwinBackbone(
+            model_name=backbone_name,
+            embed_dim=embed_dim,
+            image_size=image_size,
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim, num_heads=bev_num_heads, dropout=dropout, batch_first=True
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=bev_num_heads,
+            dim_feedforward=embed_dim * 4,
+            batch_first=True,
+            dropout=dropout,
+        )
+        self.bev_encoder = nn.TransformerEncoder(encoder_layer, num_layers=bev_encoder_layers)
+        self.head = BEVDetectionHead(embed_dim=embed_dim, num_classes=num_classes)
+
+        x_bounds = bev_bounds["x"]
+        y_bounds = bev_bounds["y"]
+        bev_w = int((x_bounds[1] - x_bounds[0]) / bev_resolution)
+        bev_h = int((y_bounds[1] - y_bounds[0]) / bev_resolution)
+        self.bev_shape = (bev_h, bev_w)
+        self.register_buffer(
+            "bev_queries",
+            torch.zeros(bev_h * bev_w, embed_dim),
+        )
+        grid = create_bev_grid(x_bounds, y_bounds, bev_resolution, device=torch.device("cpu"))
+        self.register_buffer("bev_coords", grid, persistent=False)
+
+        self.pos_embed = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+    def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        bsz, num_cams, _, _, _ = images.shape
+        images = images.view(bsz * num_cams, *images.shape[2:])
+        features = self.backbone(images)[-1]  # use highest-level feature
+        _, c, h, w = features.shape
+        features = features.view(bsz, num_cams, c, h, w)
+        tokens = []
+        for cam in range(num_cams):
+            feat = features[:, cam]
+            token = feat.flatten(2).transpose(1, 2)  # (B, HW, C)
+            tokens.append(token)
+        camera_tokens = torch.cat(tokens, dim=1)
+
+        bev_queries = self.bev_queries.unsqueeze(0).expand(bsz, -1, -1)
+        query = bev_queries + self.pos_embed(bev_queries)
+        bev_with_image = self._cross_attend(query, camera_tokens)
+        bev_latent = self.bev_encoder(bev_with_image)
+        cls_logits, box_preds = self.head(bev_latent)
+
+        return {
+            "bev_features": bev_latent,
+            "cls_logits": cls_logits.view(bsz, *self.bev_shape, -1),
+            "box_preds": box_preds.view(bsz, *self.bev_shape, -1),
+        }
+
+    def _cross_attend(self, query: torch.Tensor, camera_tokens: torch.Tensor) -> torch.Tensor:
+        """Run cross attention in manageable chunks to limit memory overhead."""
+        chunk = self.attn_chunk_size
+        if chunk is None or chunk <= 0 or chunk >= query.shape[1]:
+            attn_output, _ = self.cross_attn(
+                query, camera_tokens, camera_tokens, need_weights=False
+            )
+            return attn_output
+
+        outputs = []
+        for start in range(0, query.shape[1], chunk):
+            end = min(start + chunk, query.shape[1])
+            attn_chunk, _ = self.cross_attn(
+                query[:, start:end, :],
+                camera_tokens,
+                camera_tokens,
+                need_weights=False,
+            )
+            outputs.append(attn_chunk)
+        return torch.cat(outputs, dim=1)

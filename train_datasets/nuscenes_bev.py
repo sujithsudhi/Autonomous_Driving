@@ -1,0 +1,178 @@
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+
+from utils.nuscenes_utils import (
+    annotation_to_array,
+    get_nuscenes_handle,
+    load_calibration_matrices,
+)
+from nuscenes.utils.splits import create_splits_scenes
+
+
+@dataclass
+class Sample:
+    images: torch.Tensor
+    intrinsics: torch.Tensor
+    extrinsics: torch.Tensor
+    gt_boxes: torch.Tensor
+    gt_classes: torch.Tensor
+
+
+class NuScenesBEVDataset(Dataset):
+    """Camera-only nuScenes dataset tailored for BEVFormer-Lite."""
+
+    def __init__(
+        self,
+        dataroot: str,
+        version: str,
+        cameras: Sequence[str],
+        bev_bounds: Dict[str, Sequence[float]],
+        transform: Optional[Any] = None,
+        split: str = "train",
+        image_size: Optional[Sequence[int]] = None,
+    ) -> None:
+        self.dataroot = dataroot
+        self.version = version
+        self.cameras = list(cameras)
+        self.transform = transform
+        self.split = split
+        self.image_size = tuple(image_size) if image_size is not None else None
+        self.nusc = get_nuscenes_handle(version=version, dataroot=dataroot)
+
+        self.sample_tokens = self._collect_split_tokens(split)
+        self.bev_bounds = bev_bounds
+
+    def _collect_split_tokens(self, split: str) -> List[str]:
+        split_file = os.path.join(
+            self.dataroot, "splits", self.version, f"{split}.txt"
+        )
+        if os.path.exists(split_file):
+            with open(split_file, "r", encoding="utf-8") as f:
+                return [line.strip() for line in f if line.strip()]
+
+        # Fall back to NuScenes built-in splits when custom list not provided.
+        scene_splits = create_splits_scenes()
+        scenes = set(scene_splits.get(split, []))
+        tokens: List[str] = []
+        if scenes:
+            for scene_rec in self.nusc.scene:
+                if scene_rec["name"] not in scenes:
+                    continue
+                sample_token = scene_rec["first_sample_token"]
+                while sample_token:
+                    tokens.append(sample_token)
+                    sample_rec = self.nusc.get("sample", sample_token)
+                    sample_token = sample_rec["next"]
+        return tokens
+
+    def __len__(self) -> int:
+        return len(self.sample_tokens)
+
+    def _load_images(self, sample_rec: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        images = []
+        intrinsics = []
+        extrinsics = []
+        for cam_name in self.cameras:
+            data_token = sample_rec["data"][cam_name]
+            sd_rec = self.nusc.get("sample_data", data_token)
+            im = Image.open(os.path.join(self.nusc.dataroot, sd_rec["filename"])).convert("RGB")
+            if self.image_size is not None:
+                im = im.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
+            if self.transform is not None:
+                im = self.transform(im)
+            else:
+                im = torch.from_numpy(np.array(im)).permute(2, 0, 1).float() / 255.0
+
+            cam_intr, cam_extr = load_calibration_matrices(self.nusc, sd_rec)
+            images.append(im)
+            intrinsics.append(torch.from_numpy(cam_intr).float())
+            extrinsics.append(torch.from_numpy(cam_extr).float())
+
+        return (
+            torch.stack(images, dim=0),
+            torch.stack(intrinsics, dim=0),
+            torch.stack(extrinsics, dim=0),
+        )
+
+    def _load_boxes(self, sample_rec: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+        gt_boxes = []
+        gt_labels = []
+        for ann_token in sample_rec["anns"]:
+            ann = self.nusc.get("sample_annotation", ann_token)
+            box, label = annotation_to_array(ann)
+            gt_boxes.append(box)
+            gt_labels.append(label)
+
+        if not gt_boxes:
+            gt_boxes = torch.zeros((0, 7), dtype=torch.float32)
+            gt_labels = torch.zeros((0,), dtype=torch.long)
+        else:
+            gt_boxes = torch.tensor(np.stack(gt_boxes), dtype=torch.float32)
+            gt_labels = torch.tensor(np.stack(gt_labels), dtype=torch.long)
+        return gt_boxes, gt_labels
+
+    def __getitem__(self, idx: int) -> Sample:
+        sample_token = self.sample_tokens[idx]
+        sample_rec = self.nusc.get("sample", sample_token)
+        images, intrinsics, extrinsics = self._load_images(sample_rec)
+        gt_boxes, gt_labels = self._load_boxes(sample_rec)
+        return Sample(
+            images=images,
+            intrinsics=intrinsics,
+            extrinsics=extrinsics,
+            gt_boxes=gt_boxes,
+            gt_classes=gt_labels,
+        )
+
+
+def collate_bevformer(batch: Sequence[Sample]) -> Dict[str, torch.Tensor]:
+    """Pad variable number of boxes while stacking image tensors."""
+    images = torch.stack([sample.images for sample in batch], dim=0)
+    intrinsics = torch.stack([sample.intrinsics for sample in batch], dim=0)
+    extrinsics = torch.stack([sample.extrinsics for sample in batch], dim=0)
+
+    max_boxes = max(sample.gt_boxes.shape[0] for sample in batch)
+    padded_boxes = []
+    padded_labels = []
+    masks = []
+    for sample in batch:
+        count = sample.gt_boxes.shape[0]
+        pad = max_boxes - count
+        if pad > 0:
+            boxes = torch.cat(
+                [
+                    sample.gt_boxes,
+                    torch.zeros((pad, sample.gt_boxes.shape[1]), device=sample.gt_boxes.device),
+                ],
+                dim=0,
+            )
+            labels = torch.cat(
+                [
+                    sample.gt_classes,
+                    torch.full((pad,), -1, dtype=torch.long, device=sample.gt_classes.device),
+                ],
+                dim=0,
+            )
+            mask = torch.cat([torch.ones(count), torch.zeros(pad)], dim=0)
+        else:
+            boxes = sample.gt_boxes
+            labels = sample.gt_classes
+            mask = torch.ones(count)
+        padded_boxes.append(boxes)
+        padded_labels.append(labels)
+        masks.append(mask)
+
+    return {
+        "images": images,
+        "intrinsics": intrinsics,
+        "extrinsics": extrinsics,
+        "gt_boxes": torch.stack(padded_boxes, dim=0),
+        "gt_labels": torch.stack(padded_labels, dim=0),
+        "gt_masks": torch.stack(masks, dim=0),
+    }
