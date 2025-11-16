@@ -78,6 +78,7 @@ def main() -> None:
         dropout=cfg["model"]["dropout"],
         image_size=tuple(cfg["dataset"]["image_size"]),
         attn_chunk_size=cfg["model"].get("cross_attn_chunk_size", 256),
+        max_attn_elements=cfg["model"].get("max_cross_attn_elements", 25_000_000),
     ).to(device)
 
     if distributed:

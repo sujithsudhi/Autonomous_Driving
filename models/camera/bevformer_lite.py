@@ -22,11 +22,13 @@ class BEVFormerLite(nn.Module):
         dropout: float = 0.1,
         image_size: Tuple[int, int] = (224, 224),
         attn_chunk_size: int = 256,
+        max_attn_elements: int = 25_000_000,
     ) -> None:
         super().__init__()
         self.num_cams = num_cams
         self.embed_dim = embed_dim
         self.attn_chunk_size = attn_chunk_size
+        self.max_attn_elements = max_attn_elements
         self.backbone = SwinBackbone(
             model_name=backbone_name,
             embed_dim=embed_dim,
@@ -89,8 +91,28 @@ class BEVFormerLite(nn.Module):
 
     def _cross_attend(self, query: torch.Tensor, camera_tokens: torch.Tensor) -> torch.Tensor:
         """Run cross attention in manageable chunks to limit memory overhead."""
-        chunk = self.attn_chunk_size
-        if chunk is None or chunk <= 0 or chunk >= query.shape[1]:
+        chunk = self.attn_chunk_size or query.shape[1]
+        max_chunk = max(
+            1,
+            int(
+                self.max_attn_elements
+                // max(1, query.shape[0] * self.cross_attn.num_heads * camera_tokens.shape[1])
+            ),
+        )
+
+        if chunk <= 0 or chunk >= query.shape[1]:
+            chunk = query.shape[1]
+
+        if chunk > max_chunk:
+            if not hasattr(self, "_warned_chunk"):
+                print(
+                    f"[BEVFormerLite] Reducing cross-attn chunk size from {chunk} to {max_chunk} "
+                    "to avoid excessive attention memory."
+                )
+                self._warned_chunk = True
+            chunk = max_chunk
+
+        if chunk >= query.shape[1]:
             attn_output, _ = self.cross_attn(
                 query, camera_tokens, camera_tokens, need_weights=False
             )
