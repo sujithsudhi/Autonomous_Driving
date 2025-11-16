@@ -2,6 +2,7 @@ from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.backbones.swin_backbone import SwinBackbone
 from models.camera.bev_head import BEVDetectionHead
@@ -119,13 +120,45 @@ class BEVFormerLite(nn.Module):
             return attn_output
 
         outputs = []
+        # Project K/V once to avoid redundant allocations for each chunk
+        k_proj = F.linear(
+            camera_tokens,
+            self.cross_attn.in_proj_weight[self.embed_dim : 2 * self.embed_dim],
+            self.cross_attn.in_proj_bias[self.embed_dim : 2 * self.embed_dim]
+            if self.cross_attn.in_proj_bias is not None
+            else None,
+        )
+        v_proj = F.linear(
+            camera_tokens,
+            self.cross_attn.in_proj_weight[2 * self.embed_dim :],
+            self.cross_attn.in_proj_bias[2 * self.embed_dim :]
+            if self.cross_attn.in_proj_bias is not None
+            else None,
+        )
+        k_proj = k_proj.view(query.shape[0], -1, self.cross_attn.num_heads, self.cross_attn.head_dim)
+        v_proj = v_proj.view(query.shape[0], -1, self.cross_attn.num_heads, self.cross_attn.head_dim)
+        k_proj = k_proj.transpose(1, 2)
+        v_proj = v_proj.transpose(1, 2)
+
         for start in range(0, query.shape[1], chunk):
             end = min(start + chunk, query.shape[1])
-            attn_chunk, _ = self.cross_attn(
+            q_proj = F.linear(
                 query[:, start:end, :],
-                camera_tokens,
-                camera_tokens,
-                need_weights=False,
+                self.cross_attn.in_proj_weight[: self.embed_dim],
+                self.cross_attn.in_proj_bias[: self.embed_dim]
+                if self.cross_attn.in_proj_bias is not None
+                else None,
             )
-            outputs.append(attn_chunk)
+            q_proj = q_proj.view(query.shape[0], -1, self.cross_attn.num_heads, self.cross_attn.head_dim)
+            q_proj = q_proj.transpose(1, 2)
+
+            attn_output = F.scaled_dot_product_attention(
+                q_proj,
+                k_proj,
+                v_proj,
+                dropout_p=self.cross_attn.dropout if self.training else 0.0,
+            )
+            attn_output = attn_output.transpose(1, 2).reshape(query.shape[0], -1, self.embed_dim)
+            attn_output = self.cross_attn.out_proj(attn_output)
+            outputs.append(attn_output)
         return torch.cat(outputs, dim=1)
