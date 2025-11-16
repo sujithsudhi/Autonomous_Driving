@@ -208,9 +208,13 @@ def main() -> None:
     use_amp = cfg["optimization"].get("mixed_precision", device.type == "cuda")
     scaler = GradScaler(enabled=device.type == "cuda" and use_amp)
 
+    train_history = []
+    val_history = []
+    best_epoch = None
+
     def autocast_context():
         if device.type == "cuda":
-            return amp.autocast(device_type="cuda", enabled=scaler.is_enabled())
+            return autocast(enabled=scaler.is_enabled())
         return nullcontext()
 
     if args.resume:
@@ -221,10 +225,12 @@ def main() -> None:
         start_epoch = checkpoint["epoch"]
         best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         epochs_since_improvement = checkpoint.get("epochs_since_improvement", 0)
+        best_epoch = checkpoint.get("best_epoch", start_epoch)
     else:
         start_epoch = 0
         best_val_loss = float("inf")
         epochs_since_improvement = 0
+        best_epoch = None
 
     output_dir = Path(cfg["experiment"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +342,7 @@ def main() -> None:
         if val_loss + 1e-6 < best_val_loss:
             best_val_loss = val_loss
             epochs_since_improvement = 0
+            best_epoch = epoch + 1
             if is_main_process():
                 checkpoint = {
                     "epoch": epoch + 1,
@@ -344,6 +351,7 @@ def main() -> None:
                     "scheduler": scheduler.state_dict(),
                     "best_val_loss": best_val_loss,
                     "epochs_since_improvement": epochs_since_improvement,
+                    "best_epoch": best_epoch,
                 }
                 ckpt_path = output_dir / "best.pth"
                 torch.save(checkpoint, ckpt_path)
@@ -370,6 +378,25 @@ def main() -> None:
                 f"val_total={val['loss_total']:.4f}, val_cls={val['loss_cls']:.4f}, "
                 f"val_box={val['loss_box']:.4f}"
             )
+
+        metrics_path = output_dir / "metrics.txt"
+        with metrics_path.open("w", encoding="utf-8") as handle:
+            handle.write("epoch,train_total,train_cls,train_box,val_total,val_cls,val_box\n")
+            for idx, (trn, val) in enumerate(zip(train_history, val_history)):
+                handle.write(
+                    f"{idx+1},{trn['loss_total']:.6f},{trn['loss_cls']:.6f},{trn['loss_box']:.6f},"
+                    f"{val['loss_total']:.6f},{val['loss_cls']:.6f},{val['loss_box']:.6f}\n"
+                )
+
+            best_epoch_str = str(best_epoch) if best_epoch is not None else "N/A"
+            best_val_loss_str = (
+                f"{best_val_loss:.6f}" if best_val_loss < float("inf") else "N/A"
+            )
+            handle.write(
+                f"\nBest epoch: {best_epoch_str}\nBest val loss: {best_val_loss_str}\n"
+            )
+
+        print(f"Saved training metrics to {metrics_path}")
 
 
 if __name__ == "__main__":
