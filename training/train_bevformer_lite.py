@@ -1,35 +1,28 @@
+"""Train BEVFormer-Lite using a modular trainer."""
+
+from __future__ import annotations
+
 import argparse
 import gc
-import os
 import sys
-from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Tuple
 
 import torch
-import torch.distributed as dist
-import yaml
-from torch.amp import GradScaler, autocast
+from torch.amp import GradScaler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from train_datasets.nuscenes_bev import NuScenesBEVDataset, collate_bevformer
 from models.camera.bevformer_lite import BEVFormerLite
+from train_datasets.nuscenes_bev import NuScenesBEVDataset, collate_bevformer
+from training.config import TrainingConfig
+from training.engine import BEVFormerLiteTrainer, TrainerState, write_history
 from training.losses_bev import BEVDetectionLoss
 from utils.distributed import barrier, init_distributed, is_main_process
-
-
-def format_losses(losses: Dict[str, float]) -> str:
-    return (
-        f"total={losses.get('loss_total', float('nan')):.3f} "
-        f"cls={losses.get('loss_cls', float('nan')):.3f} "
-        f"box={losses.get('loss_box', float('nan')):.3f}"
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,58 +37,124 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_config(path: str) -> Dict:
-    with open(path, "r", encoding="utf-8") as handle:
-        return yaml.safe_load(handle)
+def load_config(path: str) -> TrainingConfig:
+    """Load a structured config matching the Transformers-style YAML layout."""
+
+    return TrainingConfig.from_yaml(path)
 
 
-def validate(
-    model: torch.nn.Module,
-    dataloader: DataLoader,
-    criterion: BEVDetectionLoss,
-    device: torch.device,
-    use_amp: bool,
-) -> Tuple[float, Dict[str, float]]:
-    model.eval()
-    total_loss = 0.0
-    total_items = 0
-    loss_components = {"loss_cls": 0.0, "loss_box": 0.0}
+def prepare_environment(device: torch.device) -> None:
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
-    with torch.no_grad():
-        for batch in dataloader:
-            images = batch["images"].to(device)
-            gt_boxes = batch["gt_boxes"].to(device)
-            gt_labels = batch["gt_labels"].to(device)
-            gt_masks = batch["gt_masks"].to(device)
 
-            batch_size = images.size(0)
-            with autocast(device_type='cuda', enabled=use_amp):
-                preds = model(images)
-                losses = criterion(
-                    preds["cls_logits"],
-                    preds["box_preds"],
-                    gt_boxes,
-                    gt_labels,
-                    gt_masks,
-                )
+def build_dataloader(
+    cfg: TrainingConfig, split: str, shuffle: bool, batch_size: int, num_workers: int
+) -> DataLoader:
+    dataset = NuScenesBEVDataset(
+        dataroot=cfg.dataset.root,
+        version=cfg.dataset.version,
+        cameras=cfg.dataset.cameras,
+        bev_bounds=cfg.dataset.bev_bounds,
+        split=split,
+        image_size=cfg.dataset.image_size,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=shuffle,
+        collate_fn=collate_bevformer,
+    )
 
-            total_loss += losses["loss_total"].item() * batch_size
-            loss_components["loss_cls"] += losses["loss_cls"].item() * batch_size
-            loss_components["loss_box"] += losses["loss_box"].item() * batch_size
-            total_items += batch_size
 
-    if dist.is_initialized():
-        buffer = torch.tensor(
-            [total_loss, loss_components["loss_cls"], loss_components["loss_box"], total_items],
-            device=device,
+def build_dataloaders(cfg: TrainingConfig, distributed: bool) -> Tuple[DataLoader, DataLoader]:
+    train_loader = build_dataloader(
+        cfg,
+        split=cfg.dataset.train_split,
+        shuffle=not distributed,
+        batch_size=cfg.optimization.batch_size,
+        num_workers=cfg.optimization.num_workers,
+    )
+    val_loader = build_dataloader(
+        cfg,
+        split=cfg.dataset.val_split,
+        shuffle=False,
+        batch_size=cfg.optimization.val_batch_size or cfg.optimization.batch_size,
+        num_workers=cfg.optimization.val_num_workers or cfg.optimization.num_workers,
+    )
+    return train_loader, val_loader
+
+
+def build_model(cfg: TrainingConfig, device: torch.device, distributed: bool) -> torch.nn.Module:
+    model = BEVFormerLite(
+        bev_bounds=cfg.dataset.bev_bounds,
+        bev_resolution=cfg.dataset.bev_resolution,
+        num_cams=len(cfg.dataset.cameras),
+        backbone_name=cfg.model.backbone,
+        embed_dim=cfg.model.embed_dim,
+        num_classes=cfg.model.num_classes,
+        bev_encoder_layers=cfg.model.bev_encoder_layers,
+        bev_num_heads=cfg.model.bev_num_heads,
+        dropout=cfg.model.dropout,
+        image_size=tuple(cfg.dataset.image_size),
+        attn_chunk_size=cfg.model.cross_attn_chunk_size,
+        max_attn_elements=cfg.model.max_cross_attn_elements,
+        camera_token_stride=cfg.model.camera_token_stride,
+    ).to(device)
+
+    if distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None
         )
-        dist.all_reduce(buffer, op=dist.ReduceOp.SUM)
-        total_loss, cls_sum, box_sum, total_items = buffer.tolist()
-        loss_components = {"loss_cls": cls_sum, "loss_box": box_sum}
+    return model
 
-    denom = max(total_items, 1)
-    averaged = {k: v / denom for k, v in loss_components.items()}
-    return total_loss / denom, averaged
+
+def build_optimizer_and_scheduler(
+    cfg: TrainingConfig, model: torch.nn.Module
+) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.ReduceLROnPlateau]:
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.optimization.lr,
+        weight_decay=cfg.optimization.weight_decay,
+    )
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=cfg.optimization.lr_reduce_factor,
+        patience=cfg.optimization.lr_plateau_patience,
+    )
+    return optimizer, scheduler
+
+
+def resume_if_available(trainer: BEVFormerLiteTrainer, path: str | None) -> TrainerState:
+    if path:
+        state = trainer.load_checkpoint(path)
+        if is_main_process():
+            print(
+                f"Resumed from {path}: starting at epoch {state.epoch + 1}, "
+                f"best val loss {state.best_val_loss:.4f}"
+            )
+        return state
+    return TrainerState()
+
+
+def log_epoch_summary(train_history, val_history) -> None:
+    if not is_main_process() or not train_history:
+        return
+    print("\n=== Training & Validation Loss History ===")
+    for idx, (trn, val) in enumerate(zip(train_history, val_history)):
+        print(
+            f"Epoch {idx+1:03d}: "
+            f"train_total={trn['loss_total']:.4f}, train_cls={trn['loss_cls']:.4f}, "
+            f"train_box={trn['loss_box']:.4f} | "
+            f"val_total={val['loss_total']:.4f}, val_cls={val['loss_cls']:.4f}, "
+            f"val_box={val['loss_box']:.4f}"
+        )
 
 
 def main() -> None:
@@ -103,313 +162,51 @@ def main() -> None:
     cfg = load_config(args.config)
     distributed = init_distributed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
 
-    dataset = NuScenesBEVDataset(
-        dataroot=cfg["dataset"]["root"],
-        version=cfg["dataset"]["version"],
-        cameras=cfg["dataset"]["cameras"],
-        bev_bounds=cfg["dataset"]["bev_bounds"],
-        split=cfg["dataset"].get("train_split", "train"),
-        image_size=cfg["dataset"]["image_size"],
-    )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=cfg["optimization"]["batch_size"],
-        shuffle=not distributed,
-        num_workers=cfg["optimization"]["num_workers"],
-        pin_memory=True,
-        drop_last=True,
-        collate_fn=collate_bevformer,
-    )
-    val_split = cfg["dataset"].get("val_split", "val")
-    val_dataset = NuScenesBEVDataset(
-        dataroot=cfg["dataset"]["root"],
-        version=cfg["dataset"]["version"],
-        cameras=cfg["dataset"]["cameras"],
-        bev_bounds=cfg["dataset"]["bev_bounds"],
-        split=val_split,
-        image_size=cfg["dataset"]["image_size"],
-    )
-    val_batch_size = cfg["optimization"].get("val_batch_size", cfg["optimization"]["batch_size"])
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=val_batch_size,
-        shuffle=False,
-        num_workers=cfg["optimization"]["num_workers"],
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_bevformer,
-    )
+    prepare_environment(device)
 
-    val_dataset = NuScenesBEVDataset(
-        dataroot=cfg["dataset"]["root"],
-        version=cfg["dataset"]["version"],
-        cameras=cfg["dataset"]["cameras"],
-        bev_bounds=cfg["dataset"]["bev_bounds"],
-        split="val",
-        image_size=cfg["dataset"]["image_size"],
-    )
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=cfg["optimization"].get("val_batch_size", cfg["optimization"]["batch_size"]),
-        shuffle=False,
-        num_workers=cfg["optimization"].get("val_num_workers", cfg["optimization"]["num_workers"]),
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=collate_bevformer,
-    )
-
-    model = BEVFormerLite(
-        bev_bounds=cfg["dataset"]["bev_bounds"],
-        bev_resolution=cfg["dataset"]["bev_resolution"],
-        num_cams=len(cfg["dataset"]["cameras"]),
-        backbone_name=cfg["model"]["backbone"],
-        embed_dim=cfg["model"]["embed_dim"],
-        num_classes=cfg["model"]["num_classes"],
-        bev_encoder_layers=cfg["model"]["bev_encoder_layers"],
-        bev_num_heads=cfg["model"]["bev_num_heads"],
-        dropout=cfg["model"]["dropout"],
-        image_size=tuple(cfg["dataset"]["image_size"]),
-        attn_chunk_size=cfg["model"].get("cross_attn_chunk_size", 256),
-        max_attn_elements=cfg["model"].get("max_cross_attn_elements", 25_000_000),
-        camera_token_stride=cfg["model"].get("camera_token_stride", 1),
-    ).to(device)
-
-    if distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[torch.cuda.current_device()] if torch.cuda.is_available() else None
-        )
-
+    train_loader, val_loader = build_dataloaders(cfg, distributed)
+    model = build_model(cfg, device, distributed)
     criterion = BEVDetectionLoss(
-        bev_bounds=cfg["dataset"]["bev_bounds"],
-        bev_resolution=cfg["dataset"]["bev_resolution"],
+        bev_bounds=cfg.dataset.bev_bounds,
+        bev_resolution=cfg.dataset.bev_resolution,
+        cls_weight=cfg.loss.cls_weight,
+        box_weight=cfg.loss.box_weight,
     )
+    optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg["optimization"]["lr"],
-        weight_decay=cfg["optimization"]["weight_decay"],
-    )
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=cfg["optimization"].get("lr_reduce_factor", 0.5),
-        patience=cfg["optimization"].get("lr_plateau_patience", 5),
-    )
-    use_amp = cfg["optimization"].get("mixed_precision", device.type == "cuda")
+    use_amp = cfg.optimization.mixed_precision if device.type == "cuda" else False
     scaler = GradScaler(enabled=device.type == "cuda" and use_amp)
 
-    train_history = []
-    val_history = []
-    best_epoch = None
+    trainer = BEVFormerLiteTrainer(
+        model=model,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        output_dir=Path(cfg.experiment.output_dir),
+        early_stop_patience=cfg.optimization.early_stop_patience,
+        max_grad_norm=cfg.optimization.max_grad_norm,
+        use_amp=use_amp,
+        distributed=distributed,
+    )
 
-    def autocast_context():
-        if device.type == "cuda":
-            return autocast(device_type='cuda',enabled=scaler.is_enabled())
-        return nullcontext()
+    state = resume_if_available(trainer, args.resume)
 
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        start_epoch = checkpoint["epoch"]
-        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        epochs_since_improvement = checkpoint.get("epochs_since_improvement", 0)
-        best_epoch = checkpoint.get("best_epoch", start_epoch)
-    else:
-        start_epoch = 0
-        best_val_loss = float("inf")
-        epochs_since_improvement = 0
-        best_epoch = None
+    train_history, val_history, state = trainer.fit(
+        num_epochs=cfg.optimization.epochs,
+        state=state,
+    )
 
-    output_dir = Path(cfg["experiment"]["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    early_stop_patience = cfg["optimization"].get("early_stop_patience", 10)
-
-    for epoch in range(start_epoch, cfg["optimization"]["epochs"]):
-        model.train()
-        epoch_totals = {"loss_total": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
-        num_train_batches = 0
-        train_progress = tqdm(
-            dataloader,
-            desc=f"Train Epoch {epoch + 1}",
-            total=len(dataloader),
-            dynamic_ncols=True,
-            leave=False,
-            disable=not is_main_process(),
-        )
-
-        for step, batch in enumerate(train_progress):
-            images = batch["images"].to(device)
-            gt_boxes = batch["gt_boxes"].to(device)
-            gt_labels = batch["gt_labels"].to(device)
-            gt_masks = batch["gt_masks"].to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_context():
-                preds = model(images)
-                losses = criterion(
-                    preds["cls_logits"],
-                    preds["box_preds"],
-                    gt_boxes,
-                    gt_labels,
-                    gt_masks,
-                )
-                loss_total = losses["loss_total"]
-
-            scaler.scale(loss_total).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            scaler.step(optimizer)
-            scaler.update()
-
-            num_train_batches += 1
-            for key in epoch_totals.keys():
-                epoch_totals[key] += losses[key].item()
-
-            if is_main_process():
-                current_avg = {
-                    key: epoch_totals[key] / max(num_train_batches, 1) for key in epoch_totals.keys()
-                }
-                train_progress.set_postfix_str(format_losses(current_avg))
-
-        if is_main_process():
-            train_progress.close()
-
-        train_epoch = {
-            key: (epoch_totals[key] / max(num_train_batches, 1)) for key in epoch_totals.keys()
-        }
-        train_history.append(train_epoch)
-
-        model.eval()
-        val_totals = {"loss_total": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
-        val_counts = 0
-        val_progress = tqdm(
-            val_dataloader,
-            desc=f"Val Epoch {epoch + 1}",
-            total=len(val_dataloader),
-            dynamic_ncols=True,
-            leave=False,
-            disable=not is_main_process(),
-        )
-
-        with torch.no_grad():
-            for val_step, batch in enumerate(val_progress):
-                images = batch["images"].to(device)
-                gt_boxes = batch["gt_boxes"].to(device)
-                gt_labels = batch["gt_labels"].to(device)
-                gt_masks = batch["gt_masks"].to(device)
-
-                with autocast_context():
-                    preds = model(images)
-                    losses = criterion(
-                        preds["cls_logits"],
-                        preds["box_preds"],
-                        gt_boxes,
-                        gt_labels,
-                        gt_masks,
-                    )
-                val_counts += 1
-                for key in val_totals.keys():
-                    val_totals[key] += losses[key].item()
-
-                if is_main_process():
-                    current_avg = {
-                        key: val_totals[key] / max(val_counts, 1) for key in val_totals.keys()
-                    }
-                    val_progress.set_postfix_str(format_losses(current_avg))
-
-        if is_main_process():
-            val_progress.close()
-
-        val_epoch = {}
-        if val_counts > 0:
-            val_epoch = {key: val_totals[key] / val_counts for key in epoch_totals.keys()}
-        else:
-            val_epoch = {key: float("nan") for key in epoch_totals.keys()}
-        val_history.append(val_epoch)
-
-        if is_main_process():
-            print(
-                f"[Epoch {epoch+1}] Train total={train_epoch['loss_total']:.4f}, "
-                f"Val total={val_epoch['loss_total']:.4f}"
-            )
-
-        val_loss, val_components = validate(model, val_dataloader, criterion, device, use_amp)
-        scheduler.step(val_loss)
-
-        if is_main_process():
-            lr = optimizer.param_groups[0]["lr"]
-            print(
-                f"Epoch {epoch+1} validation: loss={val_loss:.3f} "
-                f"cls={val_components['loss_cls']:.3f} "
-                f"box={val_components['loss_box']:.3f} lr={lr:.6f}"
-            )
-
-        if val_loss + 1e-6 < best_val_loss:
-            best_val_loss = val_loss
-            epochs_since_improvement = 0
-            best_epoch = epoch + 1
-            if is_main_process():
-                checkpoint = {
-                    "epoch": epoch + 1,
-                    "model": model.module.state_dict() if distributed else model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "best_val_loss": best_val_loss,
-                    "epochs_since_improvement": epochs_since_improvement,
-                    "best_epoch": best_epoch,
-                }
-                ckpt_path = output_dir / "best.pth"
-                torch.save(checkpoint, ckpt_path)
-                print(f"Saved best checkpoint to {ckpt_path}")
-        else:
-            epochs_since_improvement += 1
-            if epochs_since_improvement >= early_stop_patience:
-                if is_main_process():
-                    print(
-                        f"Early stopping at epoch {epoch+1} after "
-                        f"{epochs_since_improvement} epochs without improvement."
-                    )
-                break
-
-        barrier()
-
-    if is_main_process() and train_history:
-        print("\n=== Training & Validation Loss History ===")
-        for idx, (trn, val) in enumerate(zip(train_history, val_history)):
-            print(
-                f"Epoch {idx+1:03d}: "
-                f"train_total={trn['loss_total']:.4f}, train_cls={trn['loss_cls']:.4f}, "
-                f"train_box={trn['loss_box']:.4f} | "
-                f"val_total={val['loss_total']:.4f}, val_cls={val['loss_cls']:.4f}, "
-                f"val_box={val['loss_box']:.4f}"
-            )
-
-        metrics_path = output_dir / "metrics.txt"
-        with metrics_path.open("w", encoding="utf-8") as handle:
-            handle.write("epoch,train_total,train_cls,train_box,val_total,val_cls,val_box\n")
-            for idx, (trn, val) in enumerate(zip(train_history, val_history)):
-                handle.write(
-                    f"{idx+1},{trn['loss_total']:.6f},{trn['loss_cls']:.6f},{trn['loss_box']:.6f},"
-                    f"{val['loss_total']:.6f},{val['loss_cls']:.6f},{val['loss_box']:.6f}\n"
-                )
-
-            best_epoch_str = str(best_epoch) if best_epoch is not None else "N/A"
-            best_val_loss_str = (
-                f"{best_val_loss:.6f}" if best_val_loss < float("inf") else "N/A"
-            )
-            handle.write(
-                f"\nBest epoch: {best_epoch_str}\nBest val loss: {best_val_loss_str}\n"
-            )
-
-        print(f"Saved training metrics to {metrics_path}")
+    barrier()
+    log_epoch_summary(train_history, val_history)
+    if is_main_process():
+        output_dir = Path(cfg.experiment.output_dir)
+        cfg.dump(output_dir / "config.yaml")
+        write_history(output_dir, train_history, val_history, state)
 
 
 if __name__ == "__main__":

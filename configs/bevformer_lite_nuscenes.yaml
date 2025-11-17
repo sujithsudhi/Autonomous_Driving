@@ -45,6 +45,11 @@ optimization:
   lr_plateau_patience: 5
   lr_reduce_factor: 0.5
   early_stop_patience: 10
+  max_grad_norm: 5.0
+
+loss:
+  cls_weight: 1.0
+  box_weight: 1.0
 
 logging:
   print_interval: 20
