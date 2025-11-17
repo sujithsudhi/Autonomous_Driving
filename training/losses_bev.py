@@ -28,6 +28,7 @@ class BEVDetectionLoss(nn.Module):
     def forward(
         self,
         cls_logits: torch.Tensor,
+        obj_logits: torch.Tensor,
         box_preds: torch.Tensor,
         gt_boxes: torch.Tensor,
         gt_labels: torch.Tensor,
@@ -36,11 +37,16 @@ class BEVDetectionLoss(nn.Module):
         bsz = cls_logits.shape[0]
         num_cells = self.bev_w * self.bev_h
         cls_logits = cls_logits.view(bsz, num_cells, -1)
+        obj_logits = obj_logits.view(bsz, num_cells)
         box_preds = box_preds.view(bsz, num_cells, -1)
 
-        cls_targets = torch.zeros_like(cls_logits)
+        device = cls_logits.device
+        cls_targets = torch.full(
+            (bsz, num_cells), fill_value=-1, device=device, dtype=torch.long
+        )
+        obj_targets = torch.zeros((bsz, num_cells), device=device)
         box_targets = torch.zeros_like(box_preds)
-        reg_masks = torch.zeros(bsz, num_cells, device=cls_logits.device)
+        positive_mask = torch.zeros((bsz, num_cells), device=device, dtype=torch.bool)
 
         for b in range(bsz):
             boxes = gt_boxes[b][gt_masks[b] > 0.5]
@@ -49,34 +55,45 @@ class BEVDetectionLoss(nn.Module):
                 if label < 0:
                     continue
                 idx = self._box_to_index(box)
-                if idx is None:
+                if idx is None or positive_mask[b, idx]:
                     continue
-                cls_targets[b, idx, label] = 1.0
+                cls_targets[b, idx] = int(label.item())
+                obj_targets[b, idx] = 1.0
                 box_targets[b, idx] = box
-                reg_masks[b, idx] = 1.0
+                positive_mask[b, idx] = True
 
-        positive = int(reg_masks.sum().item())
+        positive = int(positive_mask.sum().item())
+        negatives = obj_targets.numel() - positive
         if positive == 0 and not self._warned_empty:
             print(
                 "[BEVDetectionLoss] No ground-truth boxes fell inside the BEV grid; "
-                "box regression loss will stay at zero. Check bev_bounds relative to the dataset."
+                "objectness/box regression losses will stay near zero. "
+                "Check bev_bounds relative to the dataset."
             )
             self._warned_empty = True
 
-        cls_loss = F.binary_cross_entropy_with_logits(cls_logits, cls_targets, reduction="none")
-        cls_loss = cls_loss.sum(dim=-1).mean()
+        pos_weight = max(1.0, negatives / (positive + 1e-6))
+        obj_loss = F.binary_cross_entropy_with_logits(
+            obj_logits,
+            obj_targets,
+            pos_weight=torch.tensor(pos_weight, device=device, dtype=obj_logits.dtype),
+        )
 
-        if reg_masks.sum() > 0:
-            box_loss = F.smooth_l1_loss(box_preds, box_targets, reduction="none").sum(-1)
-            box_loss = (box_loss * reg_masks).sum() / (reg_masks.sum() + 1e-6)
+        if positive > 0:
+            cls_loss = F.cross_entropy(
+                cls_logits[positive_mask], cls_targets[positive_mask]
+            )
+            box_loss = F.smooth_l1_loss(box_preds[positive_mask], box_targets[positive_mask])
         else:
-            box_loss = torch.zeros(1, device=cls_logits.device)
+            cls_loss = torch.zeros(1, device=device)
+            box_loss = torch.zeros(1, device=device)
 
-        total = self.cls_weight * cls_loss + self.box_weight * box_loss
+        total = obj_loss + self.cls_weight * cls_loss + self.box_weight * box_loss
         return {
             "loss_total": total,
             "loss_cls": cls_loss,
             "loss_box": box_loss,
+            "loss_obj": obj_loss,
         }
 
     def _box_to_index(self, box: torch.Tensor) -> int:

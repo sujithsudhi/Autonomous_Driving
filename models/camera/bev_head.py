@@ -11,6 +11,12 @@ class BEVDetectionHead(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, num_classes),
         )
+        self.obj_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, 1),
+        )
         self.box_head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
@@ -19,6 +25,7 @@ class BEVDetectionHead(nn.Module):
         )
 
     def forward(self, bev_feats: torch.Tensor) -> torch.Tensor:
-        logits = self.cls_head(bev_feats)
+        cls_logits = self.cls_head(bev_feats)
+        obj_logits = self.obj_head(bev_feats)
         boxes = self.box_head(bev_feats)
-        return logits, boxes
+        return cls_logits, obj_logits, boxes

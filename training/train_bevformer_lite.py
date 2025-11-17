@@ -173,10 +173,10 @@ def log_epoch_summary(train_history, val_history) -> None:
     for idx, (trn, val) in enumerate(zip(train_history, val_history)):
         print(
             f"Epoch {idx+1:03d}: "
-            f"train_total={trn['loss_total']:.4f}, train_cls={trn['loss_cls']:.4f}, "
-            f"train_box={trn['loss_box']:.4f} | "
-            f"val_total={val['loss_total']:.4f}, val_cls={val['loss_cls']:.4f}, "
-            f"val_box={val['loss_box']:.4f}"
+            f"train_total={trn['loss_total']:.4f}, train_obj={trn.get('loss_obj', float('nan')):.4f}, "
+            f"train_cls={trn['loss_cls']:.4f}, train_box={trn['loss_box']:.4f} | "
+            f"val_total={val['loss_total']:.4f}, val_obj={val.get('loss_obj', float('nan')):.4f}, "
+            f"val_cls={val['loss_cls']:.4f}, val_box={val['loss_box']:.4f}"
         )
 
 
@@ -203,22 +203,21 @@ def main() -> None:
     use_amp = cfg.optimization.mixed_precision if device.type == "cuda" else False
     scaler = GradScaler(enabled=device.type == "cuda" and use_amp)
 
-    trainer = BEVFormerLiteTrainer(
-        model=model,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        scaler=scaler,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        output_dir=Path(cfg.experiment.output_dir),
-        early_stop_patience=cfg.optimization.early_stop_patience,
-        max_grad_norm=cfg.optimization.max_grad_norm,
-        use_amp=use_amp,
-        distributed=distributed,
-        wandb_run=wandb_run,
-    )
+    trainer = BEVFormerLiteTrainer(model=model,
+                                   criterion=criterion,
+                                   optimizer=optimizer,
+                                   scheduler=scheduler,
+                                   scaler=scaler,
+                                   train_loader=train_loader,
+                                   val_loader=val_loader,
+                                   device=device,
+                                   output_dir=Path(cfg.experiment.output_dir),
+                                   early_stop_patience=cfg.optimization.early_stop_patience,
+                                   max_grad_norm=cfg.optimization.max_grad_norm,
+                                   use_amp=use_amp,
+                                   distributed=distributed,
+                                   wandb_run=wandb_run,
+                                  )
 
     state = resume_if_available(trainer, args.resume)
 

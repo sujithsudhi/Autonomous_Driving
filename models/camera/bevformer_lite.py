@@ -87,11 +87,12 @@ class BEVFormerLite(nn.Module):
         query = bev_queries + bev_pos.unsqueeze(0)
         bev_with_image = self._cross_attend(query, camera_tokens)
         bev_latent = self.bev_encoder(bev_with_image)
-        cls_logits, box_preds = self.head(bev_latent)
+        cls_logits, obj_logits, box_preds = self.head(bev_latent)
 
         return {
             "bev_features": bev_latent,
             "cls_logits": cls_logits.view(bsz, *self.bev_shape, -1),
+            "obj_logits": obj_logits.view(bsz, *self.bev_shape, -1),
             "box_preds": box_preds.view(bsz, *self.bev_shape, -1),
         }
 

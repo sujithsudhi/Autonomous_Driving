@@ -29,11 +29,13 @@ class TrainerState:
 
 
 def format_losses(losses: Dict[str, float]) -> str:
-    return (
-        f"total={losses.get('loss_total', float('nan')):.3f} "
-        f"cls={losses.get('loss_cls', float('nan')):.3f} "
-        f"box={losses.get('loss_box', float('nan')):.3f}"
-    )
+    parts = [
+        f"total={losses.get('loss_total', float('nan')):.3f}",
+        f"obj={losses.get('loss_obj', float('nan')):.3f}",
+        f"cls={losses.get('loss_cls', float('nan')):.3f}",
+        f"box={losses.get('loss_box', float('nan')):.3f}",
+    ]
+    return " ".join(parts)
 
 
 def write_history(
@@ -47,11 +49,17 @@ def write_history(
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = output_dir / "metrics.txt"
     with metrics_path.open("w", encoding="utf-8") as handle:
-        handle.write("epoch,train_total,train_cls,train_box,val_total,val_cls,val_box\n")
+        handle.write(
+            "epoch,train_total,train_obj,train_cls,train_box,"
+            "val_total,val_obj,val_cls,val_box\n"
+        )
         for idx, (trn, val) in enumerate(zip(train_history, val_history)):
             handle.write(
-                f"{idx+1},{trn['loss_total']:.6f},{trn['loss_cls']:.6f},{trn['loss_box']:.6f},"
-                f"{val['loss_total']:.6f},{val['loss_cls']:.6f},{val['loss_box']:.6f}\n"
+                f"{idx+1},"
+                f"{trn['loss_total']:.6f},{trn.get('loss_obj', float('nan')):.6f},"
+                f"{trn['loss_cls']:.6f},{trn['loss_box']:.6f},"
+                f"{val['loss_total']:.6f},{val.get('loss_obj', float('nan')):.6f},"
+                f"{val['loss_cls']:.6f},{val['loss_box']:.6f}\n"
             )
 
         best_epoch_str = str(state.best_epoch) if state.best_epoch is not None else "N/A"
@@ -115,6 +123,7 @@ class BEVFormerLiteTrainer:
             preds = self.model(batch["images"])
             losses = self.criterion(
                 preds["cls_logits"],
+                preds["obj_logits"],
                 preds["box_preds"],
                 batch["gt_boxes"],
                 batch["gt_labels"],
@@ -167,9 +176,11 @@ class BEVFormerLiteTrainer:
         log_payload = {
             "epoch": epoch,
             "train/loss_total": train_epoch.get("loss_total"),
+            "train/loss_obj": train_epoch.get("loss_obj"),
             "train/loss_cls": train_epoch.get("loss_cls"),
             "train/loss_box": train_epoch.get("loss_box"),
             "val/loss_total": val_epoch.get("loss_total"),
+            "val/loss_obj": val_epoch.get("loss_obj"),
             "val/loss_cls": val_epoch.get("loss_cls"),
             "val/loss_box": val_epoch.get("loss_box"),
             "lr": lr,
@@ -178,7 +189,7 @@ class BEVFormerLiteTrainer:
 
     def train_one_epoch(self) -> Dict[str, float]:
         self.model.train()
-        epoch_totals = {"loss_total": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
+        epoch_totals = {"loss_total": 0.0, "loss_obj": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
         num_batches = 0
 
         train_progress = tqdm(
@@ -219,7 +230,7 @@ class BEVFormerLiteTrainer:
         self.model.eval()
         total_loss = 0.0
         total_items = 0
-        loss_components = {"loss_cls": 0.0, "loss_box": 0.0}
+        loss_components = {"loss_obj": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
 
         val_progress = tqdm(
             self.val_loader,
@@ -238,6 +249,7 @@ class BEVFormerLiteTrainer:
                     preds = self.model(batch["images"])
                     losses = self.criterion(
                         preds["cls_logits"],
+                        preds["obj_logits"],
                         preds["box_preds"],
                         batch["gt_boxes"],
                         batch["gt_labels"],
@@ -245,6 +257,7 @@ class BEVFormerLiteTrainer:
                     )
 
                 total_loss += losses["loss_total"].item() * batch_size
+                loss_components["loss_obj"] += losses["loss_obj"].item() * batch_size
                 loss_components["loss_cls"] += losses["loss_cls"].item() * batch_size
                 loss_components["loss_box"] += losses["loss_box"].item() * batch_size
                 total_items += batch_size
@@ -258,12 +271,18 @@ class BEVFormerLiteTrainer:
 
         if dist.is_initialized():
             buffer = torch.tensor(
-                [total_loss, loss_components["loss_cls"], loss_components["loss_box"], total_items],
+                [
+                    total_loss,
+                    loss_components["loss_obj"],
+                    loss_components["loss_cls"],
+                    loss_components["loss_box"],
+                    total_items,
+                ],
                 device=self.device,
             )
             dist.all_reduce(buffer, op=dist.ReduceOp.SUM)
-            total_loss, cls_sum, box_sum, total_items = buffer.tolist()
-            loss_components = {"loss_cls": cls_sum, "loss_box": box_sum}
+            total_loss, obj_sum, cls_sum, box_sum, total_items = buffer.tolist()
+            loss_components = {"loss_obj": obj_sum, "loss_cls": cls_sum, "loss_box": box_sum}
 
         denom = max(total_items, 1)
         averaged = {k: v / denom for k, v in loss_components.items()}
@@ -291,6 +310,7 @@ class BEVFormerLiteTrainer:
             if is_main_process():
                 print(
                     f"Epoch {epoch+1} validation: loss={val_loss:.3f} "
+                    f"obj={val_components['loss_obj']:.3f} "
                     f"cls={val_components['loss_cls']:.3f} "
                     f"box={val_components['loss_box']:.3f} lr={lr:.6f}"
                 )
