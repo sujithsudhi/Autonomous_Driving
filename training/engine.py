@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -13,6 +13,9 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from utils.distributed import barrier, is_main_process
+
+if TYPE_CHECKING:
+    import wandb
 
 
 @dataclass
@@ -80,6 +83,7 @@ class BEVFormerLiteTrainer:
         max_grad_norm: float,
         use_amp: bool,
         distributed: bool,
+        wandb_run: Optional["wandb.sdk.wandb_run.Run"] = None,
     ) -> None:
         self.model = model
         self.criterion = criterion
@@ -94,6 +98,7 @@ class BEVFormerLiteTrainer:
         self.max_grad_norm = max_grad_norm
         self.use_amp = use_amp
         self.distributed = distributed
+        self.wandb_run = wandb_run
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -152,6 +157,24 @@ class BEVFormerLiteTrainer:
 
     def _aggregate_losses(self, totals: Dict[str, float], counts: int) -> Dict[str, float]:
         return {key: totals[key] / max(counts, 1) for key in totals.keys()}
+
+    def _log_epoch_metrics(
+        self, epoch: int, train_epoch: Dict[str, float], val_epoch: Dict[str, float], lr: float
+    ) -> None:
+        if self.wandb_run is None or not is_main_process():
+            return
+
+        log_payload = {
+            "epoch": epoch,
+            "train/loss_total": train_epoch.get("loss_total"),
+            "train/loss_cls": train_epoch.get("loss_cls"),
+            "train/loss_box": train_epoch.get("loss_box"),
+            "val/loss_total": val_epoch.get("loss_total"),
+            "val/loss_cls": val_epoch.get("loss_cls"),
+            "val/loss_box": val_epoch.get("loss_box"),
+            "lr": lr,
+        }
+        self.wandb_run.log(log_payload, step=epoch)
 
     def train_one_epoch(self) -> Dict[str, float]:
         self.model.train()
@@ -264,8 +287,8 @@ class BEVFormerLiteTrainer:
 
             state.epoch = epoch + 1
 
+            lr = self.optimizer.param_groups[0]["lr"]
             if is_main_process():
-                lr = self.optimizer.param_groups[0]["lr"]
                 print(
                     f"Epoch {epoch+1} validation: loss={val_loss:.3f} "
                     f"cls={val_components['loss_cls']:.3f} "
@@ -286,6 +309,8 @@ class BEVFormerLiteTrainer:
                             f"{state.epochs_since_improvement} epochs without improvement."
                         )
                     break
+
+            self._log_epoch_metrics(epoch + 1, train_epoch, val_epoch, lr)
 
             barrier()
 

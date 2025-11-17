@@ -74,9 +74,14 @@ class LossConfig:
 
 @dataclass
 class LoggingConfig:
-    """Console/logging settings."""
+    """Console logging and optional experiment tracking settings."""
 
     print_interval: int = 20
+    wandb_enabled: bool = False
+    wandb_project: Optional[str] = None
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_tags: List[str] = field(default_factory=list)
 
 
 @dataclass

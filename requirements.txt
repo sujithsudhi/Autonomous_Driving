@@ -7,3 +7,4 @@ Pillow>=9.0
 pyyaml>=6.0
 matplotlib>=3.7
 tqdm>=4.66
+wandb>=0.16

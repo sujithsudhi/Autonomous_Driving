@@ -53,3 +53,8 @@ loss:
 
 logging:
   print_interval: 20
+  wandb_enabled: false
+  wandb_project: bevformer-lite
+  wandb_entity: null
+  wandb_run_name: bevformer-lite-nuscenes
+  wandb_tags: [bevformer, nuscenes]
