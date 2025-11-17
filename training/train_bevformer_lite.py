@@ -43,6 +43,29 @@ def load_config(path: str) -> TrainingConfig:
     return TrainingConfig.from_yaml(path)
 
 
+def setup_wandb(cfg: TrainingConfig):
+    """Initialize Weights & Biases run when requested."""
+
+    if not cfg.logging.wandb_enabled or not is_main_process():
+        return None
+
+    try:
+        import wandb
+    except ImportError:
+        print("wandb is not installed; skipping experiment tracking.")
+        return None
+
+    run = wandb.init(
+        project=cfg.logging.wandb_project or cfg.experiment.name,
+        entity=cfg.logging.wandb_entity,
+        name=cfg.logging.wandb_run_name or cfg.experiment.name,
+        tags=cfg.logging.wandb_tags or None,
+        config=cfg.to_dict(),
+        resume="allow",
+    )
+    return run
+
+
 def prepare_environment(device: torch.device) -> None:
     gc.collect()
     if device.type == "cuda":
@@ -163,6 +186,8 @@ def main() -> None:
     distributed = init_distributed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    wandb_run = setup_wandb(cfg)
+
     prepare_environment(device)
 
     train_loader, val_loader = build_dataloaders(cfg, distributed)
@@ -192,14 +217,21 @@ def main() -> None:
         max_grad_norm=cfg.optimization.max_grad_norm,
         use_amp=use_amp,
         distributed=distributed,
+        wandb_run=wandb_run,
     )
 
     state = resume_if_available(trainer, args.resume)
 
-    train_history, val_history, state = trainer.fit(
-        num_epochs=cfg.optimization.epochs,
-        state=state,
-    )
+    try:
+        train_history, val_history, state = trainer.fit(
+            num_epochs=cfg.optimization.epochs,
+            state=state,
+        )
+    except Exception:
+        if wandb_run is not None:
+            # Ensure the run is closed even if training exits early.
+            wandb_run.finish()
+        raise
 
     barrier()
     log_epoch_summary(train_history, val_history)
@@ -207,6 +239,10 @@ def main() -> None:
         output_dir = Path(cfg.experiment.output_dir)
         cfg.dump(output_dir / "config.yaml")
         write_history(output_dir, train_history, val_history, state)
+        if wandb_run is not None:
+            wandb_run.summary["best_val_loss"] = state.best_val_loss
+            wandb_run.summary["best_epoch"] = state.best_epoch
+            wandb_run.finish()
 
 
 if __name__ == "__main__":
