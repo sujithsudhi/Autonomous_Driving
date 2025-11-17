@@ -18,6 +18,7 @@ class BEVDetectionLoss(nn.Module):
         self.bev_resolution = bev_resolution
         self.cls_weight = cls_weight
         self.box_weight = box_weight
+        self._warned_empty = False
 
         x_min, x_max = bev_bounds["x"]
         y_min, y_max = bev_bounds["y"]
@@ -53,6 +54,14 @@ class BEVDetectionLoss(nn.Module):
                 cls_targets[b, idx, label] = 1.0
                 box_targets[b, idx] = box
                 reg_masks[b, idx] = 1.0
+
+        positive = int(reg_masks.sum().item())
+        if positive == 0 and not self._warned_empty:
+            print(
+                "[BEVDetectionLoss] No ground-truth boxes fell inside the BEV grid; "
+                "box regression loss will stay at zero. Check bev_bounds relative to the dataset."
+            )
+            self._warned_empty = True
 
         cls_loss = F.binary_cross_entropy_with_logits(cls_logits, cls_targets, reduction="none")
         cls_loss = cls_loss.sum(dim=-1).mean()
