@@ -55,10 +55,7 @@ class BEVFormerLite(nn.Module):
         bev_w = int((x_bounds[1] - x_bounds[0]) / bev_resolution)
         bev_h = int((y_bounds[1] - y_bounds[0]) / bev_resolution)
         self.bev_shape = (bev_h, bev_w)
-        self.register_buffer(
-            "bev_queries",
-            torch.zeros(bev_h * bev_w, embed_dim),
-        )
+        self.bev_queries = nn.Parameter(torch.zeros(bev_h * bev_w, embed_dim))
         grid = create_bev_grid(x_bounds, y_bounds, bev_resolution, device=torch.device("cpu"))
         self.register_buffer("bev_coords", grid, persistent=False)
 
@@ -66,6 +63,7 @@ class BEVFormerLite(nn.Module):
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
         )
+        self.coord_proj = nn.Linear(3, embed_dim)
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         bsz, num_cams, _, _, _ = images.shape
@@ -85,7 +83,8 @@ class BEVFormerLite(nn.Module):
         camera_tokens = torch.cat(tokens, dim=1)
 
         bev_queries = self.bev_queries.unsqueeze(0).expand(bsz, -1, -1)
-        query = bev_queries + self.pos_embed(bev_queries)
+        bev_pos = self.pos_embed(self.coord_proj(self.bev_coords))
+        query = bev_queries + bev_pos.unsqueeze(0)
         bev_with_image = self._cross_attend(query, camera_tokens)
         bev_latent = self.bev_encoder(bev_with_image)
         cls_logits, box_preds = self.head(bev_latent)
