@@ -9,7 +9,7 @@ from typing import Dict, Tuple
 import torch
 import torch.distributed as dist
 import yaml
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -69,7 +69,7 @@ def validate(
             gt_masks = batch["gt_masks"].to(device)
 
             batch_size = images.size(0)
-            with autocast(enabled=use_amp):
+            with autocast(device_type='cuda', enabled=use_amp):
                 preds = model(images)
                 losses = criterion(
                     preds["cls_logits"],
@@ -199,7 +199,6 @@ def main() -> None:
         mode="min",
         factor=cfg["optimization"].get("lr_reduce_factor", 0.5),
         patience=cfg["optimization"].get("lr_plateau_patience", 5),
-        verbose=is_main_process(),
     )
     use_amp = cfg["optimization"].get("mixed_precision", device.type == "cuda")
     scaler = GradScaler(enabled=device.type == "cuda" and use_amp)
@@ -210,7 +209,7 @@ def main() -> None:
 
     def autocast_context():
         if device.type == "cuda":
-            return autocast(enabled=scaler.is_enabled())
+            return autocast(device_type='cuda',enabled=scaler.is_enabled())
         return nullcontext()
 
     if args.resume:
