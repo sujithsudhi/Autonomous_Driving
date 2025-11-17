@@ -12,6 +12,7 @@ import yaml
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,11 +30,6 @@ def format_losses(losses: Dict[str, float]) -> str:
         f"cls={losses.get('loss_cls', float('nan')):.3f} "
         f"box={losses.get('loss_box', float('nan')):.3f}"
     )
-
-
-def display_progress(prefix: str, epoch: int, step: int, total: int, losses: Dict[str, float]) -> None:
-    progress = f"[{prefix}] Epoch {epoch} {step}/{total} {format_losses(losses)}"
-    print(progress, end="\r", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -241,7 +237,16 @@ def main() -> None:
         model.train()
         epoch_totals = {"loss_total": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
         num_train_batches = 0
-        for step, batch in enumerate(dataloader):
+        train_progress = tqdm(
+            dataloader,
+            desc=f"Train Epoch {epoch + 1}",
+            total=len(dataloader),
+            dynamic_ncols=True,
+            leave=False,
+            disable=not is_main_process(),
+        )
+
+        for step, batch in enumerate(train_progress):
             images = batch["images"].to(device)
             gt_boxes = batch["gt_boxes"].to(device)
             gt_labels = batch["gt_labels"].to(device)
@@ -273,21 +278,30 @@ def main() -> None:
                 current_avg = {
                     key: epoch_totals[key] / max(num_train_batches, 1) for key in epoch_totals.keys()
                 }
-                display_progress("Train", epoch + 1, step + 1, len(dataloader), current_avg)
+                train_progress.set_postfix_str(format_losses(current_avg))
+
+        if is_main_process():
+            train_progress.close()
 
         train_epoch = {
             key: (epoch_totals[key] / max(num_train_batches, 1)) for key in epoch_totals.keys()
         }
         train_history.append(train_epoch)
 
-        if is_main_process():
-            print()
-
         model.eval()
         val_totals = {"loss_total": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
         val_counts = 0
+        val_progress = tqdm(
+            val_dataloader,
+            desc=f"Val Epoch {epoch + 1}",
+            total=len(val_dataloader),
+            dynamic_ncols=True,
+            leave=False,
+            disable=not is_main_process(),
+        )
+
         with torch.no_grad():
-            for val_step, batch in enumerate(val_dataloader):
+            for val_step, batch in enumerate(val_progress):
                 images = batch["images"].to(device)
                 gt_boxes = batch["gt_boxes"].to(device)
                 gt_labels = batch["gt_labels"].to(device)
@@ -310,10 +324,10 @@ def main() -> None:
                     current_avg = {
                         key: val_totals[key] / max(val_counts, 1) for key in val_totals.keys()
                     }
-                    display_progress("Val", epoch + 1, val_step + 1, len(val_dataloader), current_avg)
+                    val_progress.set_postfix_str(format_losses(current_avg))
 
         if is_main_process():
-            print()
+            val_progress.close()
 
         val_epoch = {}
         if val_counts > 0:
