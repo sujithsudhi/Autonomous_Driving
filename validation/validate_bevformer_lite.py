@@ -445,10 +445,11 @@ def run_inference(
     metrics: Optional[MetricTracker] = None,
     iou_threshold: float = 0.25,
 ) -> None:
-    images = batch["images"].to(device)
+    images = batch["images"].to(device, non_blocking=True)
 
-    with torch.no_grad():
-        preds = model(images)
+    with torch.inference_mode():
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            preds = model(images)
 
     boxes, labels, scores = decode_predictions(
         preds["cls_logits"].cpu(),
@@ -534,6 +535,7 @@ def main() -> None:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
         collate_fn=collate_bevformer,
     )
 

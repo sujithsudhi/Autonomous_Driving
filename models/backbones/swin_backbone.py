@@ -23,15 +23,29 @@ class SwinBackbone(nn.Module):
         self.model = timm.create_model(
             model_name,
             pretrained=pretrained,
-            features_only=True,
-            out_indices=out_indices,
+            features_only=False,
             img_size=image_size,
+            num_classes=0,
             dynamic_img_size=True,
         )
-        self.projections = nn.ModuleList(
-            [nn.LazyConv2d(embed_dim, kernel_size=1) for _ in range(len(out_indices))]
-        )
+        if hasattr(self.model, "reset_classifier"):
+            self.model.reset_classifier(0)
+        num_feats = getattr(self.model, "num_features", embed_dim)
+        self.projection = nn.Conv2d(num_feats, embed_dim, kernel_size=1)
+        first_block = self.model.layers[0].blocks[0]
+        self._base_window_size = getattr(first_block, "window_size", (7, 7))
 
     def forward(self, images: torch.Tensor) -> List[torch.Tensor]:
-        feats = self.model(images)
-        return [proj(feat) for proj, feat in zip(self.projections, feats)]
+        feats = self.model.forward_features(images)
+        if feats.dim() == 4 and feats.shape[1] != self.projection.in_channels:
+            # timm Swin returns NHWC, convert to NCHW
+            feats = feats.permute(0, 3, 1, 2).contiguous()
+        feats = self.projection(feats)
+        return [feats]
+
+    def set_image_size(self, image_size: Sequence[int]) -> None:
+        """Update Swin's internal resolution metadata."""
+        if hasattr(self.model, "set_input_size"):
+            self.model.set_input_size(img_size=tuple(image_size), window_size=self._base_window_size)
+        elif hasattr(self.model, "patch_embed"):
+            self.model.patch_embed.set_input_size(img_size=tuple(image_size))

@@ -3,8 +3,8 @@ experiment:
   output_dir: outputs/bevformer_lite
 
 dataset:
-  root: /media/sudhi/4TB/Datasets/nuscenes
-  version: v1.0-mini
+  root: /media/4TB/Datasets/nuscenes_v1trainval
+  version: v1.0-trainval
   cameras:
     - CAM_FRONT
     - CAM_FRONT_RIGHT
@@ -29,32 +29,47 @@ model:
   cross_attn_chunk_size: 128
   max_cross_attn_elements: 20000000
   camera_token_stride: 2
-  dropout: 0.1
+  dropout: 0.3
+  head_dropout: 0.05
   num_classes: 10
 
 optimization:
   epochs: 300
-  batch_size: 4
-  val_batch_size: 4
-  lr: 2.0e-4
-  weight_decay: 0.01
-  warmup_epochs: 1
-  num_workers: 4
-  val_num_workers: 2
+  batch_size: 5
+  val_batch_size: 5
+  lr: 1.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 3
+  num_workers: 10
+  val_num_workers: 8
   mixed_precision: true
   lr_plateau_patience: 5
   lr_reduce_factor: 0.5
   early_stop_patience: 10
   max_grad_norm: 5.0
+  resolution_schedule:
+    - epochs: 3
+      image_size: [256, 448]
+      lr_scale: 1.0
+      warmup_epochs: 2
+    - epochs: 297
+      image_size: [512, 896]
+      lr_scale: 1.0
+      warmup_epochs: 1
 
 loss:
   cls_weight: 1.0
   box_weight: 1.0
+  obj_weight: 3.0
+  obj_pos_weight: 2.0
+  obj_prior_prob: 0.01
+  neg_pos_ratio: 3.0
+  label_smoothing: 0.1
 
 logging:
   print_interval: 20
   wandb_enabled: true
   wandb_project: bevformer-lite
   wandb_entity: null
-  wandb_run_name: bevformer-lite-nuscenes
+  wandb_run_name: Improved loss function for imabalanced class
   wandb_tags: [bevformer, nuscenes]

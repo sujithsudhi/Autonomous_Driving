@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+import torchvision.transforms as T
 
 from utils.geometry import quaternion_to_matrix, transform_matrix
 from utils.nuscenes_utils import (
@@ -41,7 +42,7 @@ class NuScenesBEVDataset(Dataset):
         self.dataroot = dataroot
         self.version = version
         self.cameras = list(cameras)
-        self.transform = transform
+        self.transform = transform or self._default_transform()
         self.split = split
         self.image_size = tuple(image_size) if image_size is not None else None
         self.nusc = get_nuscenes_handle(version=version, dataroot=dataroot)
@@ -83,14 +84,18 @@ class NuScenesBEVDataset(Dataset):
             data_token = sample_rec["data"][cam_name]
             sd_rec = self.nusc.get("sample_data", data_token)
             im = Image.open(os.path.join(self.nusc.dataroot, sd_rec["filename"])).convert("RGB")
+            orig_w, orig_h = im.size
             if self.image_size is not None:
                 im = im.resize((self.image_size[1], self.image_size[0]), Image.BILINEAR)
-            if self.transform is not None:
-                im = self.transform(im)
-            else:
-                im = torch.from_numpy(np.array(im)).permute(2, 0, 1).float() / 255.0
+            im = self.transform(im)
 
             cam_intr, cam_extr = load_calibration_matrices(self.nusc, sd_rec)
+            if self.image_size is not None and (orig_w != self.image_size[1] or orig_h != self.image_size[0]):
+                scale_w = self.image_size[1] / float(orig_w)
+                scale_h = self.image_size[0] / float(orig_h)
+                cam_intr = cam_intr.copy()
+                cam_intr[0, :] *= scale_w
+                cam_intr[1, :] *= scale_h
             images.append(im)
             intrinsics.append(torch.from_numpy(cam_intr).float())
             extrinsics.append(torch.from_numpy(cam_extr).float())
@@ -145,6 +150,16 @@ class NuScenesBEVDataset(Dataset):
             extrinsics=extrinsics,
             gt_boxes=gt_boxes,
             gt_classes=gt_labels,
+        )
+
+    @staticmethod
+    def _default_transform() -> T.Compose:
+        """Basic RGB normalization matching ImageNet-pretrained backbones."""
+        return T.Compose(
+            [
+                T.ToTensor(),  # scales to [0,1]
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
         )
 
 

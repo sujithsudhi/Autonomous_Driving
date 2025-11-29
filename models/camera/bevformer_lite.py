@@ -21,6 +21,7 @@ class BEVFormerLite(nn.Module):
         bev_encoder_layers: int = 4,
         bev_num_heads: int = 8,
         dropout: float = 0.1,
+        head_dropout: float = 0.0,
         image_size: Tuple[int, int] = (224, 224),
         attn_chunk_size: int = 256,
         max_attn_elements: int = 25_000_000,
@@ -48,7 +49,11 @@ class BEVFormerLite(nn.Module):
             dropout=dropout,
         )
         self.bev_encoder = nn.TransformerEncoder(encoder_layer, num_layers=bev_encoder_layers)
-        self.head = BEVDetectionHead(embed_dim=embed_dim, num_classes=num_classes)
+        self.head = BEVDetectionHead(
+            embed_dim=embed_dim, num_classes=num_classes, dropout=head_dropout
+        )
+        # Bias init nudges objectness toward a low prior so positives give clear gradients.
+        self.head.init_obj_bias_from_prob(prior_prob=0.01)
 
         x_bounds = bev_bounds["x"]
         y_bounds = bev_bounds["y"]
@@ -64,6 +69,7 @@ class BEVFormerLite(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         self.coord_proj = nn.Linear(3, embed_dim)
+        self.current_image_size = tuple(image_size)
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         bsz, num_cams, _, _, _ = images.shape
@@ -95,6 +101,18 @@ class BEVFormerLite(nn.Module):
             "obj_logits": obj_logits.view(bsz, *self.bev_shape, -1),
             "box_preds": box_preds.view(bsz, *self.bev_shape, -1),
         }
+
+    def set_image_size(self, image_size: Tuple[int, int]) -> None:
+        if tuple(image_size) == self.current_image_size:
+            return
+        orig_device = next(self.backbone.parameters()).device
+        if orig_device.type != "cpu":
+            self.backbone.to("cpu")
+            self.backbone.set_image_size(image_size)
+            self.backbone.to(orig_device)
+        else:
+            self.backbone.set_image_size(image_size)
+        self.current_image_size = tuple(image_size)
 
     def _cross_attend(self, query: torch.Tensor, camera_tokens: torch.Tensor) -> torch.Tensor:
         """Run cross attention in manageable chunks to limit memory overhead."""

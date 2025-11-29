@@ -43,45 +43,65 @@ class ModelConfig:
     camera_token_stride     : int = 1
     dropout                 : float = 0.0
     num_classes             : int = 10
+    head_dropout            : float = 0.0
+    freeze_backbone         : bool = False
+
+
+@dataclass
+class ResolutionStageConfig:
+    """Progressive training stage with optional resizing/freezing."""
+
+    epochs          : int
+    image_size      : Optional[List[int]] = None
+    freeze_backbone : Optional[bool] = None
+    lr_scale        : float = 1.0
+    warmup_epochs   : int = 0
+    reset_optimizer : bool = False
 
 
 @dataclass
 class OptimizationConfig:
     """Training hyperparameters."""
 
-    epochs              : int = 300
-    batch_size          : int = 4
-    val_batch_size      : Optional[int] = None
-    lr                  : float = 2e-4
-    weight_decay        : float = 0.01
-    warmup_epochs       : int = 0
-    num_workers         : int = 4
-    val_num_workers     : Optional[int] = None
-    mixed_precision     : bool = True
-    lr_plateau_patience : int = 5
-    lr_reduce_factor    : float = 0.5
-    early_stop_patience : int = 10
-    max_grad_norm       : float = 5.0
+    epochs              : int                         = 300
+    batch_size          : int                         = 4
+    val_batch_size      : Optional[int]               = None
+    lr                  : float                       = 2e-4
+    weight_decay        : float                       = 0.01
+    warmup_epochs       : int                         = 0
+    num_workers         : int                         = 4
+    val_num_workers     : Optional[int]               = None
+    mixed_precision     : bool                        = True
+    lr_plateau_patience : int                         = 5
+    lr_reduce_factor    : float                       = 0.5
+    early_stop_patience : int                         = 10
+    max_grad_norm       : float                       = 5.0
+    resolution_schedule : List[ResolutionStageConfig] = field(default_factory=list)
 
 
 @dataclass
 class LossConfig:
     """Loss weighting parameters."""
 
-    cls_weight: float = 1.0
-    box_weight: float = 1.0
+    cls_weight     : float = 1.0
+    box_weight     : float = 1.0
+    obj_weight     : float = 1.0
+    obj_pos_weight : float = 1.0
+    obj_prior_prob : float = 0.01
+    neg_pos_ratio  : float = 3.0
+    label_smoothing: float = 0.0
 
 
 @dataclass
 class LoggingConfig:
     """Console logging and optional experiment tracking settings."""
 
-    print_interval : int = 20
-    wandb_enabled  : bool = True
+    print_interval : int           = 20
+    wandb_enabled  : bool          = True
     wandb_project  : Optional[str] = 'bevformer-lite'
     wandb_entity   : Optional[str] = None
-    wandb_run_name : Optional[str] = 'bevformer-lite-nuscenes'
-    wandb_tags     : List[str] = field(default_factory=list)
+    wandb_run_name : Optional[str] = 'Improved loss function for imabalanced class'
+    wandb_tags     : List[str]     = field(default_factory=list)
 
 
 @dataclass
@@ -97,14 +117,21 @@ class TrainingConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TrainingConfig":
-        return cls(
-            experiment=ExperimentConfig(**data["experiment"]),
-            dataset=DatasetConfig(**data["dataset"]),
-            model=ModelConfig(**data["model"]),
-            optimization=OptimizationConfig(**data["optimization"]),
-            loss=LossConfig(**data.get("loss", {})),
-            logging=LoggingConfig(**data.get("logging", {})),
-        )
+        return cls(experiment   = ExperimentConfig(**data["experiment"]),
+                   dataset      = DatasetConfig(**data["dataset"]),
+                   model        = ModelConfig(**data["model"]),
+                   optimization = TrainingConfig._build_optimization(data["optimization"]),
+                   loss         = LossConfig(**data.get("loss", {})),
+                   logging      = LoggingConfig(**data.get("logging", {})),
+                  )
+
+    @staticmethod
+    def _build_optimization(raw: Dict[str, Any]) -> OptimizationConfig:
+        payload  = dict(raw)
+        schedule = payload.pop("resolution_schedule", [])
+        stages   = [ResolutionStageConfig(**stage) for stage in schedule]
+        payload["resolution_schedule"] = stages
+        return OptimizationConfig(**payload)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TrainingConfig":
@@ -119,4 +146,3 @@ class TrainingConfig:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8") as handle:
             yaml.safe_dump(self.to_dict(), handle, sort_keys=False)
-

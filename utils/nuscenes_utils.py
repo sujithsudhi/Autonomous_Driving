@@ -1,6 +1,7 @@
 from typing import Dict, Tuple
 
 import numpy as np
+from pyquaternion import Quaternion
 
 try:
     from nuscenes.nuscenes import NuScenes
@@ -37,14 +38,18 @@ def get_nuscenes_handle(version: str, dataroot: str) -> "NuScenes":
 
 def load_calibration_matrices(nusc: "NuScenes", sample_data_rec: Dict) -> Tuple[np.ndarray, np.ndarray]:
     cs_rec = nusc.get("calibrated_sensor", sample_data_rec["calibrated_sensor_token"])
-    pose_rec = nusc.get("ego_pose", sample_data_rec["ego_pose_token"])
     cam_intr = np.array(cs_rec["camera_intrinsic"], dtype=np.float32)
-    # From camera to ego then to global
-    cam_to_ego = transform_matrix(cs_rec["translation"], cs_rec["rotation"])
-    ego_to_global = transform_matrix(pose_rec["translation"], pose_rec["rotation"])
-    cam_to_global = ego_to_global @ cam_to_ego
-    extrinsic = np.linalg.inv(cam_to_global)
-    return cam_intr, extrinsic.astype(np.float32)
+
+    # Build sensor->ego matrix using nuScenes convention (quaternion wxyz)
+    rot = Quaternion(cs_rec["rotation"]).rotation_matrix
+    trans = np.array(cs_rec["translation"], dtype=np.float32)
+    sensor_to_ego = np.eye(4, dtype=np.float32)
+    sensor_to_ego[:3, :3] = rot
+    sensor_to_ego[:3, 3] = trans
+
+    # We need ego->sensor for projecting ego-frame points into camera frame.
+    ego_to_sensor = np.linalg.inv(sensor_to_ego)
+    return cam_intr, ego_to_sensor.astype(np.float32)
 
 
 def annotation_to_array(ann_rec: Dict) -> Tuple[np.ndarray, int]:

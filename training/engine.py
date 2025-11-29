@@ -116,7 +116,14 @@ class BEVFormerLiteTrainer:
         return nullcontext()
 
     def _move_batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        return {key: tensor.to(self.device) for key, tensor in batch.items()}
+        device_keys = {"images", "gt_boxes", "gt_labels", "gt_masks"}
+        moved: Dict[str, torch.Tensor] = {}
+        for key, tensor in batch.items():
+            if key in device_keys:
+                moved[key] = tensor.to(self.device, non_blocking=True)
+            else:
+                moved[key] = tensor
+        return moved
 
     def _forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         with self._autocast_context():
@@ -167,6 +174,10 @@ class BEVFormerLiteTrainer:
     def _aggregate_losses(self, totals: Dict[str, float], counts: int) -> Dict[str, float]:
         return {key: totals[key] / max(counts, 1) for key in totals.keys()}
 
+    def _set_lr(self, lr: float) -> None:
+        for group in self.optimizer.param_groups:
+            group["lr"] = lr
+
     def _log_epoch_metrics(
         self, epoch: int, train_epoch: Dict[str, float], val_epoch: Dict[str, float], lr: float
     ) -> None:
@@ -183,6 +194,8 @@ class BEVFormerLiteTrainer:
             "val/loss_obj": val_epoch.get("loss_obj"),
             "val/loss_cls": val_epoch.get("loss_cls"),
             "val/loss_box": val_epoch.get("loss_box"),
+            "train/num_positive": train_epoch.get("num_positive"),
+            "val/num_positive": val_epoch.get("num_positive"),
             "lr": lr,
         }
         self.wandb_run.log(log_payload, step=epoch)
@@ -191,6 +204,7 @@ class BEVFormerLiteTrainer:
         self.model.train()
         epoch_totals = {"loss_total": 0.0, "loss_obj": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
         num_batches = 0
+        pos_total = 0.0
 
         train_progress = tqdm(
             self.train_loader,
@@ -214,23 +228,27 @@ class BEVFormerLiteTrainer:
             self.scaler.update()
 
             num_batches += 1
+            pos_total += float(losses.get("num_positive", 0.0))
             for key in epoch_totals.keys():
                 epoch_totals[key] += losses[key].item()
 
             if is_main_process():
                 current_avg = self._aggregate_losses(epoch_totals, num_batches)
-                train_progress.set_postfix_str(format_losses(current_avg))
+                pos_avg = pos_total / max(num_batches, 1)
+                train_progress.set_postfix_str(f"{format_losses(current_avg)} pos={pos_avg:.1f}")
 
         if is_main_process():
             train_progress.close()
 
-        return self._aggregate_losses(epoch_totals, num_batches)
+        averaged = self._aggregate_losses(epoch_totals, num_batches)
+        averaged["num_positive"] = pos_total / max(num_batches, 1)
+        return averaged
 
     def evaluate(self) -> Tuple[float, Dict[str, float]]:
         self.model.eval()
-        total_loss = 0.0
-        total_items = 0
-        loss_components = {"loss_obj": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
+        loss_totals = {"loss_total": 0.0, "loss_obj": 0.0, "loss_cls": 0.0, "loss_box": 0.0}
+        pos_total = 0.0
+        num_batches = 0
 
         val_progress = tqdm(
             self.val_loader,
@@ -244,7 +262,6 @@ class BEVFormerLiteTrainer:
         with torch.no_grad():
             for batch in val_progress:
                 batch = self._move_batch_to_device(batch)
-                batch_size = batch["images"].size(0)
                 with self._autocast_context():
                     preds = self.model(batch["images"])
                     losses = self.criterion(
@@ -256,15 +273,17 @@ class BEVFormerLiteTrainer:
                         batch["gt_masks"],
                     )
 
-                total_loss += losses["loss_total"].item() * batch_size
-                loss_components["loss_obj"] += losses["loss_obj"].item() * batch_size
-                loss_components["loss_cls"] += losses["loss_cls"].item() * batch_size
-                loss_components["loss_box"] += losses["loss_box"].item() * batch_size
-                total_items += batch_size
+                pos_total += float(losses.get("num_positive", 0.0))
+                num_batches += 1
+                for key in loss_totals.keys():
+                    loss_totals[key] += losses[key].item()
 
                 if is_main_process():
-                    averaged = self._aggregate_losses(loss_components, max(total_items, 1))
-                    val_progress.set_postfix_str(format_losses({"loss_total": total_loss / max(total_items, 1), **averaged}))
+                    averaged = self._aggregate_losses(loss_totals, num_batches)
+                    pos_avg = pos_total / max(num_batches, 1)
+                    val_progress.set_postfix_str(
+                        f"{format_losses(averaged)} pos={pos_avg:.1f}"
+                    )
 
         if is_main_process():
             val_progress.close()
@@ -272,23 +291,44 @@ class BEVFormerLiteTrainer:
         if dist.is_initialized():
             buffer = torch.tensor(
                 [
-                    total_loss,
-                    loss_components["loss_obj"],
-                    loss_components["loss_cls"],
-                    loss_components["loss_box"],
-                    total_items,
+                    loss_totals["loss_total"],
+                    loss_totals["loss_obj"],
+                    loss_totals["loss_cls"],
+                    loss_totals["loss_box"],
+                    pos_total,
+                    num_batches,
                 ],
                 device=self.device,
             )
             dist.all_reduce(buffer, op=dist.ReduceOp.SUM)
-            total_loss, obj_sum, cls_sum, box_sum, total_items = buffer.tolist()
-            loss_components = {"loss_obj": obj_sum, "loss_cls": cls_sum, "loss_box": box_sum}
+            (
+                total_loss,
+                obj_sum,
+                cls_sum,
+                box_sum,
+                pos_total,
+                num_batches,
+            ) = buffer.tolist()
+            loss_totals = {
+                "loss_total": total_loss,
+                "loss_obj": obj_sum,
+                "loss_cls": cls_sum,
+                "loss_box": box_sum,
+            }
 
-        denom = max(total_items, 1)
-        averaged = {k: v / denom for k, v in loss_components.items()}
-        return total_loss / denom, averaged
+        denom = max(num_batches, 1)
+        averaged = {k: v / denom for k, v in loss_totals.items()}
+        averaged["num_positive"] = pos_total / max(num_batches, 1)
+        return averaged["loss_total"], averaged
 
-    def fit(self, num_epochs: int, state: Optional[TrainerState] = None) -> Tuple[List[Dict[str, float]], List[Dict[str, float]], TrainerState]:
+    def fit(
+        self,
+        num_epochs: int,
+        state: Optional[TrainerState] = None,
+        stage_base_lr: float = 0.0,
+        stage_warmup_epochs: int = 0,
+        stage_start_epoch: int = 0,
+    ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]], TrainerState]:
         if state is None:
             state = TrainerState()
 
@@ -296,6 +336,17 @@ class BEVFormerLiteTrainer:
         val_history: List[Dict[str, float]] = []
 
         for epoch in range(state.epoch, num_epochs):
+            stage_epoch = epoch - stage_start_epoch
+            if stage_warmup_epochs > 0 and stage_epoch < stage_warmup_epochs:
+                warmup_factor = (stage_epoch + 1) / max(stage_warmup_epochs, 1)
+                self._set_lr(stage_base_lr * warmup_factor)
+            elif stage_warmup_epochs > 0 and stage_epoch == stage_warmup_epochs:
+                self._set_lr(stage_base_lr)
+
+            train_sampler = getattr(self.train_loader, "sampler", None)
+            if hasattr(train_sampler, "set_epoch"):
+                train_sampler.set_epoch(epoch)
+
             train_epoch = self.train_one_epoch()
             train_history.append(train_epoch)
 
@@ -312,7 +363,8 @@ class BEVFormerLiteTrainer:
                     f"Epoch {epoch+1} validation: loss={val_loss:.3f} "
                     f"obj={val_components['loss_obj']:.3f} "
                     f"cls={val_components['loss_cls']:.3f} "
-                    f"box={val_components['loss_box']:.3f} lr={lr:.6f}"
+                    f"box={val_components['loss_box']:.3f} "
+                    f"pos={val_components.get('num_positive', float('nan')):.1f} lr={lr:.6f}"
                 )
 
             if val_loss + 1e-6 < state.best_val_loss:
